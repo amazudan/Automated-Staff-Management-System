@@ -1,0 +1,160 @@
+<script>
+/* ==========================================================================
+   Login.html — window.LoginUI. The first screen of the app: the workspace is
+   never rendered until somebody has signed in (requirement 8).
+   Hybrid auth (confirmed decision):
+     • api_bootstrap reports whether the browser's Google address matches a
+       Staff row (googleMatch). It does NOT sign anybody in — the app runs as
+       the deployment owner, so a silent SSO sign-in would hand the owner's
+       dashboard to whoever opened the link on that machine.
+     • So: offer "Continue as <google email>" when there is a match, and always
+       offer the email + PIN form.
+   LoginUI.mount(root) is called by App.showLogin(); on success it hands the
+   {token, profile, config} envelope to App.onAuthenticated().
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  /** The logo from Config.CompanyLogoUrl, or the company initial. */
+  function brandBlock(company, logoUrl) {
+    if (logoUrl) {
+      return '<div class="brand-mark lg"><img src="' + UI.esc(logoUrl) +
+             '" alt="' + UI.esc(company || 'Logo') + '"></div>';
+    }
+    return '<div class="brand-mark lg">' + UI.esc((company || 'S').charAt(0)) + '</div>';
+  }
+
+  function panelSetupNeeded(company, logoUrl) {
+    return '' +
+      brandBlock(company, logoUrl) +
+      '<h1 class="login-title">Almost ready</h1>' +
+      '<p class="login-sub">The workspace has not been initialised yet — there are ' +
+      'no staff records to sign in with.</p>' +
+      '<div class="notice brand mt"><b>One-time setup</b><div class="small" style="margin-top:6px">' +
+      'Open the Apps Script editor, run the <code>setupSystem</code> function once to build the ' +
+      'sheets and seed the first administrator, then reload this page.</div></div>' +
+      '<button class="btn btn-brand block mt" id="reload">Reload</button>';
+  }
+
+  function ssoBlock(email) {
+    return '' +
+      '<button class="sso" id="ssoBtn">' +
+      '<span class="g-mark">G</span>' +
+      '<span>Continue as <b>' + UI.esc(email) + '</b></span></button>';
+  }
+
+  function pinForm(prefillEmail) {
+    return '' +
+      '<form id="pinForm" autocomplete="off">' +
+      '<div class="field"><label>Work email</label>' +
+      '<input type="email" id="loginEmail" placeholder="you@company.com" ' +
+      'value="' + UI.esc(prefillEmail || '') + '" required></div>' +
+      '<div class="field"><label>PIN</label>' +
+      '<input type="password" id="loginPin" inputmode="numeric" ' +
+      'placeholder="4–8 digit PIN" required></div>' +
+      '<div class="err hidden" id="loginErr"></div>' +
+      '<button type="submit" class="btn btn-brand block mt" id="pinSubmit">Sign in</button>' +
+      '</form>' +
+      '<p class="small muted center mt">Forgot your PIN? An administrator can reset it for you.</p>';
+  }
+
+  function panelNormal(boot, company, logoUrl) {
+    var mode = (boot.config && boot.config.authMode) || 'Hybrid';
+    var google = boot.googleEmail || '';
+    var match = !!boot.googleMatch;
+    var html = '' +
+      brandBlock(company, logoUrl) +
+      '<h1 class="login-title">Welcome back</h1>' +
+      '<p class="login-sub">Sign in to your ' + UI.esc(company) + ' workspace.</p>';
+
+    // Only offer one-tap when that Google address really is on staff.
+    if (google && match && mode !== 'PinOnly') html += ssoBlock(google);
+
+    if (mode === 'GoogleOnly') {
+      if (!google) {
+        html += '<div class="notice brand mt small">This workspace uses Google sign-in. ' +
+          'Open it while signed in to your work Google account.</div>' +
+          '<button class="btn btn-ghost block mt" id="reload">Reload</button>';
+      } else if (!match) {
+        html += '<div class="notice warn mt small">You are signed in to Google as <b>' +
+          UI.esc(google) + '</b>, but that address is not on staff. Ask an administrator ' +
+          'to add you with this exact address, then reload.</div>' +
+          '<button class="btn btn-ghost block mt" id="reload">Reload</button>';
+      }
+      return html;
+    }
+
+    if (google && match) html += '<div class="divider"><span>or use a PIN</span></div>';
+    // Never prefill the owner's Google address when it is not a staff match —
+    // it only invites the wrong person's sign-in attempt.
+    html += pinForm(match ? google : '');
+
+    if (google && !match) {
+      html += '<p class="small muted center mt">Signed in to Google as ' + UI.esc(google) +
+        ' — that address is not on staff, so use your work email and PIN.</p>';
+    }
+    return html;
+  }
+
+  function wire(root) {
+    var reload = root.querySelector('#reload');
+    if (reload) reload.addEventListener('click', function () {
+      App.boot().then(function () { rebuild(root); });
+    });
+
+    var sso = root.querySelector('#ssoBtn');
+    if (sso) sso.addEventListener('click', function () {
+      sso.disabled = true; sso.innerHTML = '<span class="spinner sm"></span> Signing in…';
+      App.public('api_loginGoogle', []).then(function (out) {
+        App.onAuthenticated(out);
+      }).catch(function (e) {
+        App.toast(e.message || 'Google sign-in failed.', 'bad');
+        rebuild(root);
+      });
+    });
+
+    var form = root.querySelector('#pinForm');
+    if (form) form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var email = root.querySelector('#loginEmail').value.trim();
+      var pin = root.querySelector('#loginPin').value.trim();
+      var err = root.querySelector('#loginErr');
+      var btn = root.querySelector('#pinSubmit');
+      err.classList.add('hidden');
+      if (!email || !pin) { err.textContent = 'Enter your email and PIN.'; err.classList.remove('hidden'); return; }
+      btn.disabled = true; var old = btn.textContent; btn.innerHTML = '<span class="spinner sm"></span> Signing in…';
+      App.public('api_login', [{ email: email, pin: pin }]).then(function (out) {
+        App.onAuthenticated(out);
+      }).catch(function (ex) {
+        err.textContent = ex.message || 'Sign in failed.'; err.classList.remove('hidden');
+        btn.disabled = false; btn.textContent = old;
+        var p = root.querySelector('#loginPin'); if (p) { p.value = ''; p.focus(); }
+      });
+    });
+  }
+
+  function rebuild(root) {
+    var boot = App.bootInfo || { config: App.state.config || {} };
+    var cfg = boot.config || App.state.config || {};
+    var company = cfg.companyName || 'Staff Management';
+    var logoUrl = cfg.companyLogoUrl || '';
+    var panel = boot.setupNeeded
+      ? panelSetupNeeded(company, logoUrl)
+      : panelNormal(boot, company, logoUrl);
+
+    root.innerHTML =
+      '<div class="login">' +
+      '<div class="login-panel"><div class="login-card">' + panel + '</div>' +
+      '<div class="login-legal">Private workspace · access is limited to registered staff.</div>' +
+      '</div></div>';
+
+    wire(root);
+    var focusEl = root.querySelector('#loginPin, #loginEmail');
+    if (focusEl && !focusEl.value) try { focusEl.focus(); } catch (e) {}
+  }
+
+  window.LoginUI = {
+    mount: function (root) { rebuild(root); }
+  };
+})();
+</script>

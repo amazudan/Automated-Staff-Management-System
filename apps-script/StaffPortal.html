@@ -1,0 +1,859 @@
+<script>
+/* ==========================================================================
+   StaffPortal.html — window.StaffUI
+   The staff member's module. Same contract as AdminUI:
+     StaffUI.nav / StaffUI.views / StaffUI.defaultView
+   Loaded BEFORE Scripts.html, so UI.* / App.* are touched only inside
+   functions (which run after boot), never at IIFE top level.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var _tasks = {}; // taskId -> mapTask_
+
+  /* ---------- helpers ---------- */
+  function esc(s) { return UI.esc(s); }
+  function money(n) { return UI.money(n); }
+  function spacer(h) { return '<div style="height:' + (h || 16) + 'px"></div>'; }
+
+  function field(label, inner, hint) {
+    return '<div class="field">' + (label ? '<label>' + esc(label) + '</label>' : '') + inner +
+      (hint ? '<div class="hint">' + esc(hint) + '</div>' : '') + '</div>';
+  }
+  function actBtn(label, act, id, cls) {
+    return '<button class="btn xs ' + (cls || '') + '" data-act="' + act +
+      '" data-id="' + esc(id || '') + '">' + esc(label) + '</button>';
+  }
+  function bind(mount, handlers) {
+    if (mount.__act) mount.removeEventListener('click', mount.__act);
+    var fn = function (e) {
+      var n = e.target.closest('[data-act]');
+      if (!n || !mount.contains(n)) return;
+      var h = handlers[n.getAttribute('data-act')];
+      if (h) { e.preventDefault(); h(n.getAttribute('data-id'), n); }
+    };
+    mount.__act = fn; mount.addEventListener('click', fn);
+  }
+  function submit(label, fn, tone) {
+    return { label: label, tone: tone || 'brand', close: false, keepOpen: true, onClick: fn };
+  }
+  function remember(list) {
+    (list || []).forEach(function (t) { if (t && t.taskId) _tasks[t.taskId] = t; }); return list;
+  }
+  function withTask(id) {
+    if (_tasks[id]) return Promise.resolve(_tasks[id]);
+    return App.api('api_taskDetail', id).then(function (d) { _tasks[d.task.taskId] = d.task; return d.task; });
+  }
+  function isOpen(t) { return ['Assigned', 'Acknowledged', 'InProgress'].indexOf(t.status) >= 0; }
+  /** A task that is live for me but that I have not yet said I received. */
+  function needsAck(t) { return t.status === 'Assigned' && !t.acknowledged; }
+
+  /* ======================================================================
+     TASK ACTIONS
+     ====================================================================== */
+  function acknowledge(taskId) {
+    App.busy(true);
+    return App.api('api_taskAcknowledge', { taskId: taskId }).then(function (r) {
+      App.busy(false);
+      App.toast('Task received — it is yours now. Report progress as you go.', 'good');
+      App.refresh();
+      return r;
+    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  function openReport(task) {
+    var cur = task.reportedProgress || 0;
+    App.modal({
+      title: 'Update progress — ' + task.title,
+      body: '<p class="muted small">Slide to where you are now. Your administrator sees this ' +
+          'percentage on the task the moment you save it; pay is released only when they ' +
+          'validate a completion %.</p>' +
+        '<div class="field"><label>Progress: <b id="pgVal">' + cur + '%</b></label>' +
+          '<input class="w-full" type="range" min="0" max="100" step="5" data-field="progress" data-type="number" value="' + cur + '" ' +
+          'oninput="document.getElementById(\'pgVal\').textContent=this.value+\'%\'"></div>' +
+        field('Note (optional)', '<textarea data-field="note" placeholder="What changed?"></textarea>',
+          'Your note is filed against the task so your manager can read it.'),
+      actions: [
+        { label: 'Cancel' },
+        submit('Save progress', function (c) {
+          var v = c.values();
+          return App.api('api_taskReportProgress', { taskId: task.taskId, progress: v.progress, note: v.note })
+            .then(function (r) {
+              App.closeModal();
+              App.toast('Progress saved — ' + UI.pct(r.reportedProgress) + '. Your manager can see it.', 'good');
+              App.refresh();
+            });
+        })
+      ]
+    });
+  }
+
+  function openDailyReport(task) {
+    App.modal({
+      title: 'Daily report — ' + task.title,
+      body: field('What did you do today?', '<textarea data-field="reportText" placeholder="At least a sentence…"></textarea>',
+          'Required before you can hand a task in for validation.') +
+        '<div class="form-2">' +
+          field('Progress now %', '<input type="number" data-field="progressPercent" data-type="number" min="0" max="100" value="' + (task.reportedProgress || 0) + '">') +
+          field('Hours spent', '<input type="number" data-field="hoursSpent" data-type="number" min="0" step="0.5" value="1">') +
+        '</div>' +
+        field('Blockers (optional)', '<input type="text" data-field="blockers" placeholder="Anything in your way?">'),
+      actions: [
+        { label: 'Cancel' },
+        submit('File report', function (c) {
+          var v = c.values();
+          if (!(v.reportText && v.reportText.trim().length >= 5)) { App.toast('Describe today’s work (5+ characters).', 'warn'); return; }
+          return App.api('api_dailyReportSubmit', {
+            taskId: task.taskId, reportText: v.reportText, progressPercent: v.progressPercent,
+            hoursSpent: v.hoursSpent, blockers: v.blockers
+          }).then(function () { App.closeModal(); App.toast('Daily report filed.', 'good'); App.refresh(); });
+        })
+      ]
+    });
+  }
+
+  function openSubmit(task) {
+    App.modal({
+      title: 'Submit for validation — ' + task.title,
+      body: '<p class="muted small">This hands the task to your manager to validate. ' +
+          'It moves to <b>Pending — yet to validate</b>; you keep the reported % unless you lower it below.</p>' +
+        field('Completion you are claiming %',
+          '<input type="number" data-field="claimedProgress" data-type="number" min="0" max="100" value="100">') +
+        '<div class="notice warn small mt"><div>You must have filed at least one daily report for this task first.</div></div>',
+      actions: [
+        { label: 'Cancel' },
+        submit('Submit', function (c) {
+          var v = c.values();
+          return App.api('api_taskSubmit', { taskId: task.taskId, claimedProgress: v.claimedProgress })
+            .then(function () { App.closeModal(); App.toast('Submitted — awaiting validation.', 'good'); App.refresh(); });
+        })
+      ]
+    });
+  }
+
+  /**
+   * Requirement 3 — the modal's footer. A task that has just gone live shows
+   * one thing only: acknowledge it. After that the full working set appears,
+   * including a per-task upload button (requirement 6).
+   */
+  function taskActions(t) {
+    var a = [{ label: 'Close' }];
+    if (needsAck(t)) {
+      a.unshift({ label: 'Upload file', close: false,
+        onClick: function () { App.openUpload({ taskId: t.taskId, taskTitle: t.title, category: 'TaskDeliverable' }); } });
+      a.unshift({ label: 'I have received this', tone: 'brand',
+        onClick: function () { return acknowledge(t.taskId); } });
+    } else if (isOpen(t)) {
+      a.unshift({ label: 'Submit', tone: 'brand', close: false, onClick: function () { openSubmit(t); } });
+      a.unshift({ label: 'Upload file', close: false,
+        onClick: function () { App.openUpload({ taskId: t.taskId, taskTitle: t.title, category: 'TaskDeliverable' }); } });
+      a.unshift({ label: 'Daily report', close: false, onClick: function () { openDailyReport(t); } });
+      a.unshift({ label: 'Update progress', close: false, onClick: function () { openReport(t); } });
+    }
+    return a;
+  }
+
+  function openTaskDetail(id) {
+    App.busy(true);
+    App.api('api_taskDetail', id).then(function (d) {
+      App.busy(false);
+      var t = d.task; _tasks[t.taskId] = t;
+
+      var head = '<div class="wrap" style="margin-bottom:12px">' + UI.taskPill(t.status) + ' ' + UI.priorityPill(t.priority) +
+        ' ' + UI.pill(t.taskType, 'outline') + (t.isPriority ? ' ' + UI.pill('Priority', 'red') : '') +
+        (t.overdue ? ' ' + UI.pill('Overdue', 'red') : '') +
+        (t.acknowledged ? ' ' + UI.pill('Received', 'green') : '') + '</div>';
+
+      // Requirement 3 — say plainly what the staff member has to do next.
+      var ack = needsAck(t)
+        ? '<div class="notice warn" style="margin:0 0 12px"><div><div class="n-title">New task — confirm you received it</div>' +
+          '<div class="n-body">Tap “I have received this” below. Your administrator is told the moment you do, ' +
+          'and you can then report progress as a percentage.</div></div></div>'
+        : (t.status === 'Scheduled'
+            ? '<div class="notice" style="margin:0 0 12px"><div><div class="n-title">Not started yet</div>' +
+              '<div class="n-body">This task goes live on its start date — it will appear in <b>To do</b> then.</div></div></div>'
+            : '');
+
+      var meta = '<div class="grid g-2" style="gap:14px">' +
+        '<div><div class="li-sub">Due</div><div class="li-title">' + esc(t.dueLabel || t.dueDate || '—') +
+          (t.rolloverCount ? ' · rolled over ' + t.rolloverCount + '×' : '') + '</div>' +
+          (t.description ? '<div class="li-sub mt">Brief</div><div>' + esc(t.description) + '</div>' : '') + '</div>' +
+        '<div>' +
+          '<div class="prog-label"><span>Progress you reported</span><b>' + UI.pct(t.reportedProgress) + '</b></div>' +
+          UI.progress(t.reportedProgress) + spacer(10) +
+          '<div class="prog-label"><span>Validated by your manager (this is what pays)</span><b>' + UI.pct(t.validatedProgress) + '</b></div>' +
+          UI.progress(t.validatedProgress) +
+          '<div class="li-sub mt">' + money(t.payable) + ' of ' + money(t.amountAllocated) + '</div>' +
+        '</div>' +
+        '</div>';
+
+      // Where this task's amount comes from: a slice of the monthly guarantee.
+      var al = d.allocation;
+      var alloc = (al && al.enabled && al.guaranteed)
+        ? '<div class="notice mt small"><div><div class="n-title">Where ' + money(al.share) + ' comes from</div>' +
+          '<div class="n-body">Your guaranteed ' + money(al.guaranteed) + ' for ' + esc(al.monthLabel) +
+          ' is shared across the ' + al.taskCount + ' task' + (al.taskCount === 1 ? '' : 's') +
+          ' due that month' + (al.mode === 'Weighted' ? ', weighted by priority' : '') + '. ' +
+          'This one pays ' + money(al.payable) + ' at ' + UI.pct(t.validatedProgress) +
+          ' validated completion — finish it and the full ' + money(al.share) + ' is released.' +
+          '</div></div></div>'
+        : '';
+
+      var warn = (t.warnings ? '<div class="notice danger mt small"><div><b>Warning:</b> ' + esc(t.warnings) + '</div></div>' : '') +
+        (t.adminComment ? '<div class="notice mt small"><div><b>Manager note:</b> ' + esc(t.adminComment) + '</div></div>' : '');
+
+      var reps = (d.reports || []).length ? d.reports.map(function (r) {
+        return '<div class="list-item flat"><div style="flex:1;min-width:0">' +
+          '<div class="li-title">' + esc(r.reportDate) + ' · ' + UI.pct(r.progressPercent) + ' ' +
+          (r.onTime ? UI.pill('On time', 'green') : UI.pill('Late', 'amber')) + ' ' + UI.reviewPill(r.reviewStatus) + '</div>' +
+          '<div class="li-sub">' + esc(r.reportText) + '</div>' +
+          (r.blockers ? '<div class="li-sub">⛔ ' + esc(r.blockers) + '</div>' : '') + '</div></div>';
+      }).join('') : '<div class="muted small">No daily reports filed yet.</div>';
+
+      var docs = (d.documents || []).length ? d.documents.map(function (u) {
+        return '<div class="file-row"><span class="file-ico">📄</span><div style="flex:1;min-width:0"><strong>' + esc(u.fileName) + '</strong>' +
+          '<div class="muted small">' + esc(u.category) + ' · ' + u.sizeKb + ' KB · ' + esc(u.uploadedAt) + '</div></div>' +
+          '<a class="btn xs" href="' + esc(u.url) + '" target="_blank" rel="noopener">Open</a></div>';
+      }).join('') : '<div class="muted small">No documents attached.</div>';
+
+      App.modal({
+        title: t.title, wide: true,
+        body: ack + head + meta + alloc + warn + spacer(14) +
+          UI.card({ title: 'My daily reports', className: 'tight', body: reps }) + spacer(12) +
+          UI.card({ title: 'Documents on this task', className: 'tight',
+            sub: 'Use “Upload file” below to attach your work', body: docs }),
+        actions: taskActions(t)
+      });
+    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  /* ======================================================================
+     ATTENDANCE / PROFILE ACTIONS
+     ====================================================================== */
+  function signIn() {
+    App.busy(true);
+    App.api('api_signAttendance', {}).then(function (r) {
+      App.busy(false);
+      r = r || {};
+      // Requirement 2 — name the person the record was written for, so a wrong
+      // identity can never go unnoticed again, and never call it a holiday.
+      var who = r.staffName ? ' for ' + r.staffName : '';
+      var late = r.minutesLate ? ' — ' + r.minutesLate + ' min late' : '';
+      var extra = (r.workingDay === false) ? ' (outside your roster — logged anyway)' : '';
+      App.toast('Signed in' + who + late + extra + '.', r.minutesLate ? 'warn' : 'good');
+      App.refresh();
+    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+  function signOut() {
+    App.busy(true);
+    App.api('api_signOutAttendance').then(function () { App.busy(false); App.toast('Signed out. See you tomorrow.', 'good'); App.refresh(); })
+      .catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  /**
+   * Requirement 2 / 5 — this card is always about the signed-in person, and it
+   * says so: the card title carries their name and staff ID so an attendance
+   * click can never look like it landed on somebody else's record.
+   */
+  function attendanceCard(att, profile) {
+    var t = att.today;
+    var me = profile || App.state.profile || {};
+    var body;
+    if (!att.signedIn) {
+      body = '<p class="muted small">You have not signed in today.</p>' +
+        '<button class="btn btn-brand block mt" data-act="signin">Sign in now</button>';
+    } else {
+      var out = t && t.logoutTime;
+      body = '<div class="wrap" style="margin-bottom:10px">' + UI.attPill(t ? t.status : 'OnTime') +
+        (t && t.loginTime ? ' ' + UI.pill('In ' + t.loginTime, 'grey') : '') +
+        (out ? ' ' + UI.pill('Out ' + t.logoutTime, 'grey') : '') +
+        (t && t.minutesLate ? ' ' + UI.pill(t.minutesLate + ' min late', 'amber') : '') + '</div>' +
+        (t && t.notes ? '<p class="muted small">' + esc(t.notes) + '</p>' : '') +
+        (out ? '<p class="muted small">You are signed out for today.</p>'
+             : '<button class="btn btn-ghost block" data-act="signout">Sign out</button>');
+    }
+    return UI.card({
+      title: 'My attendance today',
+      // UI.card escapes sub, so build it as plain text.
+      sub: [me.name || '', me.staffId || '',
+            att.stats ? UI.pct(att.stats.attendanceRate) + ' this period' : '']
+             .filter(function (x) { return x; }).join(' · '),
+      body: body
+    });
+  }
+
+  function openEditProfile(p) {
+    App.modal({
+      title: 'Edit my details',
+      body: field('Phone', '<input type="text" data-field="phone" value="' + esc(p.phone || '') + '">') +
+        field('Photo URL', '<input type="text" data-field="photoUrl" value="' + esc(p.photoUrl || '') + '" placeholder="Link to a photo">') +
+        '<div class="hint">Name, email, role and department are managed by your administrator.</div>',
+      actions: [
+        { label: 'Cancel' },
+        submit('Save', function (c) {
+          var v = c.values();
+          return App.api('api_updateMyProfile', { phone: v.phone, photoUrl: v.photoUrl })
+            .then(function () { App.closeModal(); App.toast('Details updated.', 'good'); App.refresh(); });
+        })
+      ]
+    });
+  }
+
+  /**
+   * Requirement 9 — change my PIN. The dialog names the account being changed
+   * (the old build silently changed whoever the server thought you were), keeps
+   * the digits-only rule the server enforces, and confirms with the address the
+   * server actually wrote to.
+   */
+  function openChangePin() {
+    var me = App.state.profile || {};
+    App.modal({
+      title: 'Change my PIN',
+      body: '<p class="muted small">Changing the PIN for <b>' + esc(me.name || 'your account') +
+          '</b> (' + esc(me.email || '') + '). You stay signed in; the new PIN applies next time you sign in.</p>' +
+        field('Current PIN', '<input type="password" data-field="oldPin" inputmode="numeric" autocomplete="current-password">',
+          'Leave blank only if you have never had a PIN.') +
+        field('New PIN', '<input type="password" data-field="newPin" inputmode="numeric" autocomplete="new-password" placeholder="4–8 digits">') +
+        field('Repeat new PIN', '<input type="password" data-field="newPin2" inputmode="numeric" autocomplete="new-password">'),
+      actions: [
+        { label: 'Cancel' },
+        submit('Update PIN', function (c) {
+          var v = c.values();
+          var next = String(v.newPin || '').trim();
+          if (!/^\d{4,8}$/.test(next)) { App.toast('The new PIN must be 4 to 8 digits.', 'warn'); return; }
+          if (next !== String(v.newPin2 || '').trim()) { App.toast('The two new PINs do not match.', 'warn'); return; }
+          return App.api('api_changePin', { oldPin: v.oldPin, newPin: next })
+            .then(function (r) {
+              App.closeModal();
+              App.toast('PIN changed for ' + ((r && r.email) || me.email || 'your account') + '.', 'good');
+            });
+        })
+      ]
+    });
+  }
+
+  /* ======================================================================
+     SHARED SNIPPETS
+     ====================================================================== */
+  /**
+   * One task line. Requirements 3 and 6: a live task carries its own action bar
+   * — acknowledge, report a percentage, upload a file for THIS task — so a staff
+   * member never has to guess what to do with a task that has just appeared.
+   * Pass {actions:false} for compact dashboard lists.
+   */
+  function taskRow(t, opts) {
+    opts = opts || {};
+    var bits = [];
+    if (opts.actions !== false) {
+      if (needsAck(t)) {
+        bits.push(actBtn('I have received this', 'ack', t.taskId, 'btn-brand'));
+        bits.push(actBtn('Upload file', 'upload', t.taskId));
+      } else if (isOpen(t)) {
+        bits.push(actBtn('Update progress', 'progress', t.taskId, 'btn-brand'));
+        bits.push(actBtn('Upload file', 'upload', t.taskId));
+        bits.push(actBtn('Daily report', 'report', t.taskId));
+        bits.push(actBtn('Submit', 'submit', t.taskId));
+      }
+    }
+    var bar = (isOpen(t) || t.reportedProgress || t.validatedProgress)
+      ? '<div style="margin-top:7px;max-width:340px">' +
+        '<div class="prog-label"><span>Reported ' + UI.pct(t.reportedProgress) +
+        ' · validated ' + UI.pct(t.validatedProgress) + '</span></div>' +
+        UI.progress(t.reportedProgress) + '</div>'
+      : '';
+
+    return '<div class="list-item flat" style="cursor:pointer" data-act="task" data-id="' + esc(t.taskId) +
+      '" data-search="' + esc((t.title || '') + ' ' + (t.taskType || '')) + '">' +
+      '<div style="flex:1;min-width:0"><div class="li-title">' + esc(t.title) +
+        (needsAck(t) ? ' ' + UI.pill('New — acknowledge', 'blue') : '') +
+        (t.isPriority ? ' ' + UI.pill('Priority', 'red') : '') + (t.overdue ? ' ' + UI.pill('Overdue', 'red') : '') + '</div>' +
+      '<div class="li-sub">' + esc(t.taskType) + ' · Due ' + esc(t.dueLabel || t.dueDate || '—') +
+        (t.rolloverCount ? ' · rolled ' + t.rolloverCount + '×' : '') + '</div>' + bar +
+        (bits.length ? '<div class="task-actions" style="margin-top:8px">' + bits.join('') + '</div>' : '') +
+      '</div>' +
+      '<div class="right" style="min-width:96px">' + UI.taskPill(t.status) +
+        '<div class="li-sub">' + UI.pct(t.effectiveProgress) + ' · ' + money(t.payable) + '</div></div></div>';
+  }
+
+  /** Shared handlers for any list that renders taskRow(). */
+  function taskRowHandlers() {
+    return {
+      task: function (id) { openTaskDetail(id); },
+      ack: function (id) { acknowledge(id); },
+      progress: function (id) { withTask(id).then(openReport); },
+      report: function (id) { withTask(id).then(openDailyReport); },
+      submit: function (id) { withTask(id).then(openSubmit); },
+      upload: function (id) {
+        withTask(id).then(function (t) {
+          App.openUpload({ taskId: t.taskId, taskTitle: t.title, category: 'TaskDeliverable' });
+        });
+      }
+    };
+  }
+
+  function bucketCard(icon, title, tasks, view) {
+    var body = tasks.length
+      ? tasks.slice(0, 6).map(function (t) { return taskRow(t, { actions: false }); }).join('')
+      : UI.empty('—', 'Nothing here');
+    return UI.card({
+      title: icon + ' ' + title, sub: tasks.length + ' task' + (tasks.length === 1 ? '' : 's'),
+      actions: tasks.length > 6 ? actBtn('See all', 'go', view) : '', body: body
+    });
+  }
+
+  /* ======================================================================
+     VIEWS
+     ====================================================================== */
+  var views = {};
+
+  /* ---------- Dashboard ---------- */
+  views.dashboard = {
+    title: function () { return 'Hi, ' + ((App.state.profile && App.state.profile.name || '').split(' ')[0] || 'there'); },
+    sub: function () { return 'Your workspace · ' + App.periodLabel(App.period()); },
+    render: function (mount) {
+      return App.api('api_staffDashboard', { periodType: App.period() }).then(function (d) {
+        App.setUnread(d.unread);
+        remember(d.buckets.completed); remember(d.buckets.pending); remember(d.buckets.inProgress);
+        var needReport = d.tasksNeedingReportToday || [];
+        App.setBadge('report', needReport.length);
+        App.setBadge('tasks', d.board.inProgress);
+
+        var b = d.board;
+        var kpis = UI.grid('g-4', [
+          UI.kpi({ label: 'Completed', value: b.completed, icon: '✅', foot: 'of ' + b.total + ' tasks' }),
+          UI.kpi({ label: 'Yet to validate', value: b.pending, icon: '🕵️', foot: 'With your manager' }),
+          UI.kpi({ label: 'In progress', value: b.inProgress, icon: '🔧', foot: b.overdue + ' overdue' }),
+          UI.kpi({ label: 'Net pay', value: money(d.pay.netPay), icon: '💰', dark: true,
+                   foot: d.pay.guaranteed
+                     ? 'of ' + money(d.pay.guaranteed) + ' guaranteed · ' + d.pay.periodLabel
+                     : d.pay.periodLabel })
+        ].join(''));
+
+        var alerts = '';
+        var fresh = (d.buckets.inProgress || []).filter(needsAck);
+        if (d.profile.suspended) {
+          alerts += '<div class="notice danger"><div><div class="n-title">Account suspended</div>' +
+            '<div class="n-body">You have reached the strike limit. Contact your administrator — your record is retained but you can be reinstated.</div></div></div>' + spacer(12);
+        }
+        // Requirement 3 — a task that went live today must announce itself.
+        if (fresh.length) {
+          alerts += '<div class="notice brand"><div><div class="n-title">' + fresh.length +
+            ' new task' + (fresh.length === 1 ? '' : 's') + ' assigned to you</div>' +
+            '<div class="n-body">Open each one and confirm you received it, then report progress as a percentage.</div></div>' +
+            '<button class="btn sm" data-act="go" data-id="tasks">Open my tasks</button></div>' + spacer(12);
+        }
+        if (needReport.length) {
+          alerts += '<div class="notice warn"><div><div class="n-title">' + needReport.length +
+            ' task' + (needReport.length === 1 ? '' : 's') + ' need a report today</div>' +
+            '<div class="n-body">File a quick daily report so your progress counts and you can hand work in.</div></div>' +
+            '<button class="btn btn-warn sm" data-act="go" data-id="report">File now</button></div>' + spacer(12);
+        }
+
+        var top = UI.grid('g-1-2', attendanceCard(d.attendance, d.profile) +
+          UI.card({ title: 'This period', sub: d.period.label, body: UI.barChart(d.analytics.series, { money: true }) }));
+
+        var buckets = UI.grid('g-3',
+          bucketCard('✅', 'Completed', d.buckets.completed, 'tasks') +
+          bucketCard('🕵️', 'Yet to validate', d.buckets.pending, 'tasks') +
+          bucketCard('🔧', 'In progress', d.buckets.inProgress, 'tasks'));
+
+        var payLines = (d.pay.lines || []).slice(0, 6);
+        var payBody = payLines.length ? UI.table({
+          cols: [
+            { label: 'Task', render: function (l) { return esc(l.title); } },
+            { label: 'Validated', render: function (l) { return UI.pct(l.validatedProgress); } },
+            { label: 'Allocated', align: 'right', render: function (l) { return money(l.amountAllocated); } },
+            { label: 'Earned', align: 'right', render: function (l) { return money(l.payable); } }
+          ], rows: payLines
+        }) : UI.empty('💰', 'No earnings yet this period');
+
+        var disc = d.discipline;
+        var discBody = '<div class="wrap" style="margin-bottom:8px">' +
+          UI.pill(disc.active + ' / ' + disc.limit + ' active strikes', disc.active >= disc.limit ? 'red' : (disc.active ? 'amber' : 'green')) + ' ' +
+          UI.pill(disc.lifetimeStrikes + ' lifetime', 'grey') + ' ' + UI.pill(disc.lifetimeSuspensions + ' suspension(s)', 'grey') + '</div>' +
+          (disc.history && disc.history.length ? disc.history.slice(0, 4).map(function (s) {
+            return '<div class="list-item flat"><div style="flex:1;min-width:0"><div class="li-title">' + esc(s.category) +
+              ' ' + UI.pill(s.status, s.status === 'Active' ? 'red' : 'grey') + '</div>' +
+              '<div class="li-sub">' + esc(s.date) + ' · ' + esc(s.reason) + '</div></div>' +
+              '<div class="right">' + money(s.penaltyAmount) + '</div></div>';
+          }).join('') : '<div class="muted small">Clean record — keep it up.</div>');
+
+        var bottom = UI.grid('g-2',
+          UI.card({ title: 'Earnings breakdown',
+                    sub: d.pay.autoAllocated && d.pay.guaranteed
+                      ? money(d.pay.guaranteed) + ' guaranteed · ' + UI.pct(d.pay.payoutRate) + ' released'
+                      : UI.pct(d.pay.payoutRate) + ' of allocated',
+                    actions: actBtn('Details', 'go', 'earnings'), body: payBody }) +
+          UI.card({ title: 'My conduct record', sub: 'Strikes are permanent once issued', body: discBody }));
+
+        mount.innerHTML = alerts + kpis + spacer() + top + spacer() + buckets + spacer() + bottom;
+
+        bind(mount, {
+          go: function (id) { App.setView(id); },
+          task: function (id) { openTaskDetail(id); },
+          signin: function () { signIn(); },
+          signout: function () { signOut(); }
+        });
+      });
+    }
+  };
+
+  /* ---------- My tasks ---------- */
+  views.tasks = {
+    title: 'My tasks', sub: 'Everything assigned to you — acknowledge, report progress, upload your work',
+    render: function (mount) {
+      return App.api('api_taskList', {}).then(function (list) {
+        remember(list);
+        var tab = 'open';
+        var tabs = [['open', 'To do'], ['pending', 'Yet to validate'], ['completed', 'Completed'],
+          ['scheduled', 'Upcoming'], ['failed', 'Missed']];
+        function match(t) {
+          if (tab === 'open') return isOpen(t);
+          if (tab === 'scheduled') return t.status === 'Scheduled';
+          if (tab === 'failed') return t.status === 'Failed';
+          return t.bucket === tab;
+        }
+        function countOf(key) {
+          var was = tab; tab = key; var n = list.filter(match).length; tab = was; return n;
+        }
+        var HELP = {
+          open: 'Live tasks. A brand-new one needs you to confirm you received it, then report progress as a percentage — your administrator sees the same number.',
+          pending: 'You have handed these in. They sit here until your administrator validates the completion %, which is what pays.',
+          completed: 'Validated and closed.',
+          scheduled: 'Not started yet — each moves into <b>To do</b> by itself on its start date.',
+          failed: 'Missed the deadline. Talk to your administrator if you think that is wrong.'
+        };
+        function draw() {
+          mount.querySelector('#stHelp').innerHTML = HELP[tab] || '';
+          var rows = list.filter(match);
+          mount.querySelector('#stTasks').innerHTML = rows.length
+            ? rows.map(function (t) { return taskRow(t); }).join('')
+            : UI.empty('🗂️', 'Nothing in this tab');
+          mount.querySelectorAll('#stTabs button').forEach(function (bt) {
+            bt.classList.toggle('active', bt.getAttribute('data-tab') === tab);
+          });
+        }
+        mount.innerHTML = '<div class="tabs" id="stTabs" style="margin-bottom:10px">' +
+          tabs.map(function (t) {
+            var n = countOf(t[0]);
+            return '<button data-tab="' + t[0] + '">' + esc(t[1]) + (n ? ' (' + n + ')' : '') + '</button>';
+          }).join('') + '</div>' +
+          '<p class="muted small" id="stHelp" style="margin:0 0 12px"></p>' +
+          '<div class="card tight"><div id="stTasks"></div></div>';
+        mount.querySelectorAll('#stTabs button').forEach(function (bt) {
+          bt.addEventListener('click', function () { tab = bt.getAttribute('data-tab'); draw(); });
+        });
+        draw();
+        bind(mount, taskRowHandlers());
+      });
+    }
+  };
+
+  /* ---------- Daily report ---------- */
+  views.report = {
+    title: 'Daily report', sub: 'File today’s progress on your open tasks',
+    render: function (mount) {
+      return App.api('api_taskList', {}).then(function (list) {
+        remember(list);
+        var open = list.filter(isOpen);
+        var pending = open.filter(function (t) { return !t.reportedToday; });
+        var done = open.filter(function (t) { return t.reportedToday; });
+
+        function row(t, reported) {
+          return '<div class="list-item"><div style="flex:1;min-width:0">' +
+            '<div class="li-title">' + esc(t.title) + (t.isPriority ? ' ' + UI.pill('Priority', 'red') : '') + '</div>' +
+            '<div class="li-sub">' + esc(t.taskType) + ' · Due ' + esc(t.dueLabel || t.dueDate || '—') + ' · ' + UI.pct(t.reportedProgress) + '</div></div>' +
+            (reported ? UI.pill('Reported today', 'green')
+                      : '<div class="row-gap">' + actBtn('File report', 'report', t.taskId, 'btn-brand') +
+                        actBtn('Upload file', 'upload', t.taskId) + actBtn('Submit', 'submit', t.taskId) + '</div>') + '</div>';
+        }
+
+        var pendBody = pending.length ? pending.map(function (t) { return row(t, false); }).join('')
+          : UI.empty('🎉', 'All caught up', 'Every open task has a report for today');
+        var doneBody = done.length ? done.map(function (t) { return row(t, true); }).join('') : '';
+
+        mount.innerHTML = UI.card({ title: 'Needs a report today', sub: pending.length + ' task(s)', body: pendBody }) +
+          (done.length ? spacer() + UI.card({ title: 'Already reported today', sub: done.length + ' task(s)', body: doneBody }) : '');
+
+        bind(mount, taskRowHandlers());
+      });
+    }
+  };
+
+  /* ---------- Attendance ----------
+     Requirement 5 — this page is strictly personal. The server already scopes
+     api_attendanceList to the caller for non-admins; the copy here says so, so
+     nobody expects (or looks for) the whole company's history. */
+  views.attendance = {
+    title: 'My attendance',
+    sub: function () { return 'Sign in / out and your own ' + App.periodLabel(App.period()) + ' history'; },
+    render: function (mount) {
+      return Promise.all([
+        App.api('api_staffDashboard', { periodType: App.period() }),
+        App.api('api_attendanceList', { periodType: App.period() })
+      ]).then(function (res) {
+        var d = res[0], hist = res[1], st = d.attendance.stats || {};
+        var me = d.profile || {};
+        var stats = UI.grid('g-4', [
+          UI.kpi({ label: 'Attendance', value: UI.pct(st.attendanceRate), icon: '🕘', foot: (st.present || 0) + '/' + (st.workingDays || 0) + ' days' }),
+          UI.kpi({ label: 'On time', value: st.onTime || 0, icon: '✅' }),
+          UI.kpi({ label: 'Late', value: st.late || 0, icon: '⏰', foot: (st.lateMinutes || 0) + ' min total' }),
+          UI.kpi({ label: 'Absent', value: st.absent || 0, icon: '🚫' })
+        ].join(''));
+
+        var table = UI.table({
+          cols: [
+            { label: 'Date', render: function (a) { return esc(a.date); } },
+            { label: 'Status', render: function (a) { return UI.attPill(a.status); } },
+            { label: 'In', render: function (a) { return esc(a.loginTime || '—'); } },
+            { label: 'Out', render: function (a) { return esc(a.logoutTime || '—'); } },
+            { label: 'Late', render: function (a) { return a.minutesLate ? a.minutesLate + 'm' : '—'; } },
+            { label: 'Notes', render: function (a) { return esc(a.notes || ''); } }
+          ], rows: hist, empty: 'No records this period', searchFields: ['date', 'status']
+        });
+
+        mount.innerHTML = UI.grid('g-1-2', attendanceCard(d.attendance, me) +
+          UI.card({
+            title: 'My history',
+            sub: [me.name || 'You', App.periodLabel(App.period()), hist.length + ' record(s)'].join(' · '),
+            body: '<p class="muted small" style="margin:0 0 10px">These are your records only. ' +
+                  'Other people’s attendance is visible to administrators, not to staff.</p>' + table
+          })) + spacer() + stats;
+
+        bind(mount, { signin: function () { signIn(); }, signout: function () { signOut(); } });
+      });
+    }
+  };
+
+  /* ---------- Earnings ---------- */
+  views.earnings = {
+    title: 'Earnings',
+    sub: function () { return 'Guaranteed salary, paid on progress · ' + App.periodLabel(App.period()); },
+    render: function (mount) {
+      return App.api('api_myEarnings', { periodType: App.period() }).then(function (d) {
+        var c = d.current, hist = d.history || [], al = d.allocation || null;
+        var kpis = UI.grid('g-4', [
+          UI.kpi({ label: 'Guaranteed', value: money(c.guaranteed), icon: '🎯',
+                   foot: c.tasksConsidered + ' task' + (c.tasksConsidered === 1 ? '' : 's') + ' carrying it' }),
+          UI.kpi({ label: 'Progress earned', value: money(c.progressEarned), icon: '📈',
+                   foot: UI.pct(c.payoutRate) + ' of what you were allocated' }),
+          UI.kpi({ label: 'Held (unvalidated)', value: money(c.unpaidBecauseUnvalidated), icon: '🕵️', foot: 'Pays once validated' }),
+          UI.kpi({ label: 'Net pay', value: money(c.netPay), icon: '💰', dark: true, foot: c.periodLabel })
+        ].join(''));
+
+        // Plain-English statement of how the guarantee turned into this figure.
+        var explain = '';
+        if (c.autoAllocated && c.guaranteed) {
+          explain = '<div class="notice small"><div>' +
+            'Your guaranteed salary of <b>' + money(c.guaranteed) + '</b> for ' + esc(c.periodLabel) +
+            ' is shared across the <b>' + c.tasksConsidered + '</b> task' + (c.tasksConsidered === 1 ? '' : 's') +
+            ' due this period' +
+            (c.tasksConsidered ? ' — about <b>' + money(c.grossAllocated / Math.max(c.tasksConsidered, 1)) + '</b> each' : '') +
+            (al && al.mode === 'Weighted' ? ', weighted by priority' : '') + '. ' +
+            'Each task then pays out on the completion percentage your administrator has validated, so finishing ' +
+            'everything releases the full amount.' +
+            (c.forfeited ? ' <b>' + money(c.forfeited) + '</b> has not been released yet.' : '') +
+            '</div></div>' + spacer(12);
+        } else if (!c.guaranteed) {
+          explain = '<div class="notice small"><div>No guaranteed monthly salary is on file for you yet — ' +
+            'ask your administrator to set it so your tasks carry an allocation.</div></div>' + spacer(12);
+        }
+
+        var lines = UI.table({
+          cols: [
+            { label: 'Task', render: function (l) { return '<div><div class="li-title">' + esc(l.title) + '</div><div class="li-sub">' + esc(l.taskType) + ' · ' + UI.taskPill(l.status) + '</div></div>'; } },
+            { label: 'Reported', render: function (l) { return UI.pct(l.reportedProgress); } },
+            { label: 'Validated', render: function (l) { return UI.pct(l.validatedProgress); } },
+            { label: 'Share', align: 'right', render: function (l) { return money(l.amountAllocated); } },
+            { label: 'Payable', align: 'right', render: function (l) { return '<b>' + money(l.payable) + '</b>'; } }
+          ], rows: c.lines || [], empty: 'No tasks contributing to pay yet', searchFields: ['title']
+        });
+
+        var penalties = c.penalties ? '<div class="notice danger small"><div>Strike penalties this period: <b>' + money(c.penalties) + '</b> deducted.</div></div>' + spacer(12) : '';
+
+        var histBody = hist.length ? UI.table({
+          cols: [
+            { label: 'Period', render: function (h) { return esc(h.periodLabel); } },
+            { label: 'Guaranteed', align: 'right', render: function (h) { return money(h.guaranteed); } },
+            { label: 'Earned', align: 'right', render: function (h) { return money(h.progressEarned); } },
+            { label: 'Forfeited', align: 'right', render: function (h) { return h.forfeited ? '<span class="muted">' + money(h.forfeited) + '</span>' : '—'; } },
+            { label: 'Penalties', align: 'right', render: function (h) { return money(h.penalties); } },
+            { label: 'Net', align: 'right', render: function (h) { return '<b>' + money(h.netPay) + '</b>'; } },
+            { label: 'Status', render: function (h) { return UI.payPill(h.status); } },
+            { label: 'Paid', render: function (h) { return esc(h.paidAt || '—'); } }
+          ], rows: hist
+        }) : UI.empty('🗓️', 'No payroll history yet');
+
+        mount.innerHTML = kpis + spacer() + explain + penalties +
+          UI.card({ title: 'How this period pays',
+                    sub: 'Your share of the guarantee × the validated percentage',
+                    body: lines }) + spacer() +
+          UI.card({ title: 'Payroll history', body: histBody });
+      });
+    }
+  };
+
+  /* ---------- Documents ----------
+     Requirement 6 — three kinds of file land here: what I uploaded, what is
+     attached to one of my tasks, and what an administrator sent to me
+     (Visibility = Individual, or shared with all staff). Each card says which. */
+  views.documents = {
+    title: 'Documents', sub: 'Your files, task attachments and anything sent to you',
+    render: function (mount) {
+      var me = App.state.profile || {};
+      return App.api('api_uploadList', {}).then(function (files) {
+        function origin(u) {
+          if (String(u.staffId) === String(me.staffId)) {
+            return u.taskId ? UI.pill('Mine · task ' + u.taskId, 'brand') : UI.pill('Mine', 'brand');
+          }
+          if (u.visibility === 'Individual') return UI.pill('Sent to you', 'blue');
+          if (u.taskId) return UI.pill('On your task', 'blue');
+          return UI.pill('Shared with staff', 'grey');
+        }
+        var cards = files.length ? files.map(function (u) {
+          var mine = String(u.staffId) === String(me.staffId);
+          return '<div class="card tight" data-search="' + esc(u.fileName + ' ' + u.category + ' ' + (u.staffName || '')) + '">' +
+            '<div class="row-gap" style="align-items:flex-start"><span class="file-ico">📄</span>' +
+            '<div style="flex:1;min-width:0"><div class="li-title" style="word-break:break-word">' + esc(u.fileName) + '</div>' +
+            '<div class="li-sub">' + esc(u.category) + ' · ' + u.sizeKb + ' KB · ' + esc(u.uploadedAt) + '</div>' +
+            '<div class="wrap" style="margin-top:6px">' + origin(u) +
+              (mine ? '' : ' ' + UI.pill('From ' + (u.staffName || u.uploaderEmail || 'admin'), 'outline')) + '</div>' +
+            (u.description ? '<div class="small" style="margin-top:4px">' + esc(u.description) + '</div>' : '') + '</div></div>' +
+            '<div class="row-gap mt"><a class="btn xs" href="' + esc(u.url) + '" target="_blank" rel="noopener">Open</a>' +
+            (mine ? actBtn('Delete', 'del', u.uploadId, 'btn-ghost') : '') + '</div></div>';
+        }).join('') : UI.empty('📁', 'No documents yet', 'Use “Upload document” to add one');
+
+        mount.innerHTML = '<div class="spread" style="margin-bottom:14px"><div class="wrap">' +
+          UI.pill(files.length + ' files', 'grey') + '</div>' +
+          '<button class="btn btn-brand" data-act="up">Upload document</button></div>' +
+          '<p class="muted small" style="margin:-6px 0 14px">Files you upload are private to you and your ' +
+          'administrators unless you attach them to a task. Anything an administrator sends you personally ' +
+          'appears here too.</p>' +
+          (files.length ? UI.grid('g-3', cards) : '<div class="card">' + cards + '</div>');
+
+        bind(mount, {
+          up: function () { App.openUpload(); },
+          del: function (id) {
+            App.confirm({ title: 'Delete document', message: 'Move this file to Drive trash?', confirmLabel: 'Delete', tone: 'danger' })
+              .then(function (ok) {
+                if (!ok) return;
+                App.api('api_uploadDelete', { uploadId: id })
+                  .then(function () { App.toast('Deleted.', 'good'); App.refresh(); })
+                  .catch(function (e) { App.toast(e.message, 'bad'); });
+              });
+          }
+        });
+      });
+    }
+  };
+
+  /* ---------- My reports ---------- */
+  views.reports = {
+    title: 'My reports', sub: 'Daily reports you have filed and their review status',
+    render: function (mount) {
+      return App.api('api_dailyReportList', {}).then(function (list) {
+        var table = UI.table({
+          cols: [
+            { label: 'Date', render: function (r) { return esc(r.reportDate); } },
+            { label: 'Task', render: function (r) { return esc(r.taskTitle); } },
+            { label: 'Progress', render: function (r) { return UI.pct(r.progressPercent); } },
+            { label: 'Hours', render: function (r) { return r.hoursSpent; } },
+            { label: 'On time', render: function (r) { return r.onTime ? UI.pill('Yes', 'green') : UI.pill('No', 'amber'); } },
+            { label: 'Review', render: function (r) { return UI.reviewPill(r.reviewStatus); } },
+            { label: 'Report', render: function (r) { return '<span class="muted small">' + esc(r.reportText) + '</span>'; }, search: true }
+          ], rows: list, empty: 'You have not filed any daily reports yet', searchFields: ['taskTitle', 'reportText']
+        });
+        mount.innerHTML = UI.card({ title: 'Daily report history', sub: list.length + ' report(s)', body: table });
+      });
+    }
+  };
+
+  /* ---------- Profile ----------
+     Requirement 1 — everything here comes from api_staffDashboard, which the
+     server resolves from the session token alone. The banner spells out which
+     account is signed in so a mismatch is obvious immediately. */
+  views.profile = {
+    title: 'My profile', sub: 'Your own contact details, security and conduct record',
+    render: function (mount) {
+      return App.api('api_staffDashboard', { periodType: App.period() }).then(function (d) {
+        var p = d.profile, disc = d.discipline;
+        var who = '<div class="notice brand" style="margin:0 0 16px"><div>' +
+          '<div class="n-title">Signed in as ' + esc(p.name) + ' · ' + esc(p.role) + '</div>' +
+          '<div class="n-body">' + esc(p.email) + ' · staff ID ' + esc(p.staffId) +
+          '. If this is not you, sign out and sign in with your own email and PIN.</div></div>' +
+          '<button class="btn sm" data-act="logout">Sign out</button></div>';
+
+        var details = '<div class="row-gap" style="margin-bottom:14px">' + UI.avatar(p, '') +
+          '<div><div class="card-title">' + esc(p.name) + '</div><div class="card-sub">' + esc(p.role) +
+          (p.department ? ' · ' + esc(p.department) : '') + (p.position ? ' · ' + esc(p.position) : '') + '</div>' +
+          '<div class="wrap mt">' + UI.staffPill(p.status) + (p.flagged ? ' ' + UI.pill('Flagged', 'amber') : '') + '</div></div></div>' +
+          '<div class="grid g-2">' +
+          '<div><div class="li-sub">Email</div><div class="li-title">' + esc(p.email) + '</div></div>' +
+          '<div><div class="li-sub">Phone</div><div class="li-title">' + esc(p.phone || '—') + '</div></div>' +
+          '<div><div class="li-sub">Joined</div><div class="li-title">' + esc(p.dateAdded || '—') + '</div></div>' +
+          '<div><div class="li-sub">Staff ID</div><div class="li-title mono">' + esc(p.staffId) + '</div></div>' +
+          // The figure every task allocation is worked out from.
+          '<div><div class="li-sub">Guaranteed monthly salary</div><div class="li-title">' +
+            (p.monthlySalary ? money(p.monthlySalary) : '<span class="muted">not set</span>') + '</div></div>' +
+          '</div>' +
+          (p.monthlySalary
+            ? '<p class="muted small mt">This is shared across the tasks due in each month — one task carries all of it, ' +
+              'four tasks carry a quarter each — and every task pays out on its validated completion percentage. ' +
+              'See <b>Earnings</b> for this month’s split.</p>'
+            : '');
+
+        var conduct = '<div class="wrap" style="margin-bottom:10px">' +
+          UI.pill(disc.active + ' / ' + disc.limit + ' active strikes', disc.active >= disc.limit ? 'red' : (disc.active ? 'amber' : 'green')) + ' ' +
+          UI.pill(disc.lifetimeStrikes + ' lifetime strikes', 'grey') + ' ' + UI.pill(disc.lifetimeSuspensions + ' suspension(s)', 'grey') + '</div>' +
+          '<p class="muted small">Your lifetime strike and suspension counts stay on record permanently, even after a manager clears active strikes.</p>' +
+          (disc.history && disc.history.length ? UI.table({
+            cols: [
+              { label: 'Date', render: function (s) { return esc(s.date); } },
+              { label: 'Category', render: function (s) { return esc(s.category); } },
+              { label: 'Reason', render: function (s) { return esc(s.reason); } },
+              { label: 'Penalty', align: 'right', render: function (s) { return money(s.penaltyAmount); } },
+              { label: 'Status', render: function (s) { return UI.pill(s.status, s.status === 'Active' ? 'red' : 'grey'); } }
+            ], rows: disc.history
+          }) : '');
+
+        mount.innerHTML = who + UI.grid('g-2-1',
+          UI.card({ title: 'Details', actions: actBtn('Edit', 'edit') + ' ' + actBtn('Change PIN', 'pin'), body: details }) +
+          UI.card({ title: 'Sign-in', body: '<p class="muted small">You can sign in with Google (if your address matches) or your email + PIN.</p>' +
+            '<button class="btn btn-ghost block mt" data-act="pin">Change PIN</button>' +
+            '<button class="btn btn-ghost block mt" data-act="logout">Sign out</button>' })) +
+          spacer() + UI.card({ title: 'Conduct record', sub: 'Discipline history', body: conduct });
+
+        bind(mount, {
+          edit: function () { openEditProfile(p); },
+          pin: function () { openChangePin(); },
+          logout: function () { App.logout(); }
+        });
+      });
+    }
+  };
+
+  /* ======================================================================
+     MODULE EXPORT
+     ====================================================================== */
+  window.StaffUI = {
+    defaultView: 'dashboard',
+    nav: [
+      { group: 'Overview', items: [{ id: 'dashboard', label: 'Dashboard', icon: '🏠' }] },
+      { group: 'My work', items: [
+        { id: 'tasks', label: 'My tasks', icon: '🗂️' },
+        { id: 'report', label: 'Daily report', icon: '📝' }
+      ] },
+      { group: 'Me', items: [
+        { id: 'attendance', label: 'Attendance', icon: '🕘' },
+        { id: 'earnings', label: 'Earnings', icon: '💰' },
+        { id: 'documents', label: 'Documents', icon: '📁' }
+      ] },
+      { group: 'Account', items: [
+        { id: 'reports', label: 'My reports', icon: '📊' },
+        { id: 'profile', label: 'Profile', icon: '👤' }
+      ] }
+    ],
+    views: views
+  };
+})();
+</script>

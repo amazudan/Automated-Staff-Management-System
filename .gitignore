@@ -1,0 +1,23 @@
+# ── Local tool config (do not publish) ───────────────────────────
+# clasp project ID is machine-local; each clone recreates its own.
+.clasp.json
+**/.clasp.json
+
+# Claude Code local settings / locks / scheduled-task state
+.claude/
+**/.claude/
+
+# ── Dependencies / build ─────────────────────────────────────────
+node_modules/
+**/node_modules/
+
+# Local syntax-check scratch dir
+.syntaxcheck/
+**/.syntaxcheck/
+
+# ── OS / OneDrive / editor cruft ─────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp

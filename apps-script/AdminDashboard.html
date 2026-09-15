@@ -1,0 +1,2084 @@
+<script>
+/* ==========================================================================
+   AdminDashboard.html — window.AdminUI
+   The administrator's module. Consumed by Scripts.html (App.mountModule).
+   Contract expected by the shell:
+     AdminUI.nav          = [{group, items:[{id,label,icon,count}]}]
+     AdminUI.views        = { id: {title, sub, render(mount)} }
+     AdminUI.defaultView  = 'dashboard'
+   NOTE: this file is included BEFORE Scripts.html, so window.UI / window.App
+   do not exist while this IIFE runs. Never touch UI.* / App.* at load time —
+   only inside functions, which run after boot.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  /* ---- module-local caches (per session) ---- */
+  var _tasks = {};        // taskId -> mapTask_  (for modal look-ups)
+  var _pay = {};          // payrollId -> row    (for payroll actions)
+  var _assignable = null; // cached active staff for the "assign to" pickers
+
+  /* ---------- tiny helpers (all reference UI/App lazily) ---------- */
+  function esc(s) { return UI.esc(s); }
+  function money(n) { return UI.money(n); }
+
+  function field(label, inner, hint) {
+    return '<div class="field">' +
+      (label ? '<label>' + esc(label) + '</label>' : '') + inner +
+      (hint ? '<div class="hint">' + esc(hint) + '</div>' : '') + '</div>';
+  }
+
+  function opt(list, sel) {
+    return (list || []).map(function (o) {
+      var v = (o && o.value !== undefined) ? o.value : o;
+      var t = (o && o.label !== undefined) ? o.label : o;
+      return '<option value="' + esc(v) + '"' +
+        (String(v) === String(sel) ? ' selected' : '') + '>' + esc(t) + '</option>';
+    }).join('');
+  }
+
+  function actBtn(label, act, id, cls) {
+    return '<button class="btn xs ' + (cls || '') + '" data-act="' + act +
+      '" data-id="' + esc(id || '') + '">' + esc(label) + '</button>';
+  }
+
+  function spacer(h) { return '<div style="height:' + (h || 16) + 'px"></div>'; }
+
+  // Single delegated click handler per view. Replaces the previous view's
+  // handler so listeners never stack on the persistent #view element.
+  function bind(mount, handlers) {
+    if (mount.__act) mount.removeEventListener('click', mount.__act);
+    var fn = function (e) {
+      var n = e.target.closest('[data-act]');
+      if (!n || !mount.contains(n)) return;
+      var h = handlers[n.getAttribute('data-act')];
+      if (h) { e.preventDefault(); h(n.getAttribute('data-id'), n); }
+    };
+    mount.__act = fn;
+    mount.addEventListener('click', fn);
+  }
+
+  function remember(list) {
+    (list || []).forEach(function (t) { if (t && t.taskId) _tasks[t.taskId] = t; });
+    return list;
+  }
+
+  // Resolve a task object by id, fetching detail if we do not have it cached.
+  function withTask(id) {
+    if (_tasks[id]) return Promise.resolve(_tasks[id]);
+    return App.api('api_taskDetail', id).then(function (d) {
+      _tasks[d.task.taskId] = d.task; return d.task;
+    });
+  }
+
+  function loadAssignable(force) {
+    if (_assignable && !force) return Promise.resolve(_assignable);
+    return App.api('api_staffList').then(function (list) {
+      _assignable = list.filter(function (s) { return s.status !== 'Inactive' && !s.suspended; });
+      return _assignable;
+    });
+  }
+
+  // Standard form-submit action: validation may `return;` (modal stays open),
+  // success closes manually. close:false + keepOpen:true keeps the modal open
+  // on validation return and on API rejection (App.modal re-enables the button).
+  function submit(label, fn, tone) {
+    return { label: label, tone: tone || 'brand', close: false, keepOpen: true, onClick: fn };
+  }
+
+  /* ======================================================================
+     TASK MODALS
+     ====================================================================== */
+  function taskFormBody(task, staff, mode) {
+    var cfg = App.state.config, t = task || {};
+    var manual = cfg.autoAllocateFromSalary === false;
+    var assignSection = mode === 'create'
+      ? field('Assign to',
+          '<div style="max-height:190px;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:8px;display:grid;gap:2px">' +
+          staff.map(function (s) {
+            return '<label class="check"><input type="checkbox" name="assignTo" value="' + esc(s.staffId) + '">' +
+              '<span>' + esc(s.name) + ' <span class="muted small">· ' + esc(s.department || s.role) +
+              (s.monthlySalary ? ' · ' + money(s.monthlySalary) + '/month' : ' · no salary set') +
+              '</span></span></label>';
+          }).join('') + '</div>',
+          'Pick one or more people. Assigning to several creates one copy each.')
+      : field('Assignee',
+          '<select data-field="assignedTo">' +
+          opt(staff.map(function (s) { return { value: s.staffId, label: s.name + ' · ' + (s.department || s.role) }; }), t.assignedTo) +
+          '</select>');
+
+    // Requirement: no manual allocation. The amount is derived from the
+    // assignee's guaranteed monthly salary, so the form previews it instead of
+    // asking for it.
+    var moneySection = manual
+      ? field('Amount allocated (' + esc(cfg.currency || '') + ')',
+          '<input type="number" data-field="amountAllocated" data-type="number" min="0" step="0.01" value="' +
+          (t.amountAllocated != null ? t.amountAllocated : '') + '" placeholder="0">')
+      : field('Allocation (calculated)',
+          '<div id="allocBox" class="alloc-box"><div class="muted small">Pick who this is for to see the calculated allocation.</div></div>',
+          'The guaranteed monthly salary is shared across the tasks due that month; this task then pays out on its completion percentage.');
+
+    return '' +
+      field('Title', '<input type="text" data-field="title" value="' + esc(t.title || '') + '" placeholder="e.g. Prepare Q3 deck">') +
+      field('Description', '<textarea data-field="description" placeholder="What needs doing?">' + esc(t.description || '') + '</textarea>') +
+      '<div class="form-2">' +
+        field('Type', '<select data-field="taskType">' + opt(cfg.taskTypes, t.taskType || 'Daily') + '</select>') +
+        field('Priority', '<select data-field="priority">' + opt(cfg.priorities, t.priority || 'Normal') + '</select>') +
+      '</div>' +
+      '<div class="form-2">' +
+        field('Start date', '<input type="date" data-field="startDate" value="' + esc(t.startDate || cfg.today) + '">') +
+        field('Due date', '<input type="date" data-field="dueDate" value="' + esc(t.dueDate || '') + '">') +
+      '</div>' +
+      assignSection +
+      moneySection;
+  }
+
+  /* Render one api_allocationPreview row. */
+  function allocPreviewHtml(list) {
+    if (!list || !list.length) {
+      return '<div class="muted small">Pick who this is for to see the calculated allocation.</div>';
+    }
+    return list.map(function (p) {
+      if (p.error) return '<div class="small"><b>' + esc(p.staffId) + '</b>: ' + esc(p.error) + '</div>';
+      if (!p.guaranteed) {
+        return '<div class="small"><b>' + esc(p.staffName) + '</b> has no guaranteed monthly salary yet, so this task would carry ' +
+          money(0) + '. Set their salary on the Staff tab first.</div>';
+      }
+      var others = (p.others || []).slice(0, 4).map(function (o) {
+        return '<div class="li-sub">' + esc(o.title) + ' · ' + money(o.share) +
+          (o.stored !== o.share ? ' <span class="muted">(was ' + money(o.stored) + ')</span>' : '') + '</div>';
+      }).join('');
+      var more = (p.others || []).length > 4 ? '<div class="li-sub">+ ' + ((p.others || []).length - 4) + ' more</div>' : '';
+      return '<div class="small">' +
+        '<div><b>' + esc(p.staffName) + '</b> · ' + money(p.guaranteed) + ' guaranteed for ' + esc(p.monthLabel) + '</div>' +
+        '<div class="alloc-figure">' + money(p.thisShare) + '</div>' +
+        '<div class="li-sub">' + money(p.guaranteed) + ' ÷ ' + p.taskCount + ' task' + (p.taskCount === 1 ? '' : 's') +
+          ' due in ' + esc(p.monthLabel) + (p.mode === 'Weighted' ? ' (weighted by priority)' : '') + '</div>' +
+        '<div class="li-sub">Pays out on this task’s validated completion percentage.</div>' +
+        (p.locked ? '<div class="li-sub">⚠ ' + esc(p.monthLabel) + ' payroll is already approved or paid — existing shares stay frozen.</div>' : '') +
+        (others ? '<div style="margin-top:6px"><div class="li-sub"><b>Other tasks that month</b></div>' + others + more + '</div>' : '') +
+        '</div>';
+    }).join('<div class="sep"></div>');
+  }
+
+  /* Keep the calculated allocation in step with the form. */
+  function wireAllocPreview(root, mode, taskId) {
+    var box = root.querySelector('#allocBox');
+    if (!box) return;
+    var timer = null;
+
+    function chosen() {
+      if (mode === 'create') {
+        return Array.prototype.slice.call(root.querySelectorAll('input[name="assignTo"]:checked'))
+          .map(function (x) { return x.value; });
+      }
+      var sel = root.querySelector('[data-field="assignedTo"]');
+      return sel && sel.value ? [sel.value] : [];
+    }
+
+    function run() {
+      var ids = chosen();
+      if (!ids.length) {
+        box.innerHTML = '<div class="muted small">Pick who this is for to see the calculated allocation.</div>';
+        return;
+      }
+      var due = root.querySelector('[data-field="dueDate"]');
+      var pri = root.querySelector('[data-field="priority"]');
+      box.innerHTML = '<div class="muted small">Calculating…</div>';
+      App.api('api_allocationPreview', {
+        staffIds: ids.slice(0, 8),
+        dueDate: due ? due.value : '',
+        priority: pri ? pri.value : 'Normal',
+        taskId: taskId || ''
+      }).then(function (list) {
+        box.innerHTML = allocPreviewHtml(list) +
+          (ids.length > 8 ? '<div class="li-sub">Showing the first 8 of ' + ids.length + ' people.</div>' : '');
+      }).catch(function (e) {
+        box.innerHTML = '<div class="muted small">' + esc(e.message) + '</div>';
+      });
+    }
+
+    root.addEventListener('change', function (e) {
+      var f = e.target.getAttribute ? e.target.getAttribute('data-field') : '';
+      if (e.target.name === 'assignTo' || f === 'assignedTo' || f === 'dueDate' || f === 'priority') {
+        clearTimeout(timer);
+        timer = setTimeout(run, 120);
+      }
+    });
+    run();
+  }
+
+  function openTaskCreate() {
+    App.busy(true);
+    loadAssignable().then(function (staff) {
+      App.busy(false);
+      if (!staff.length) { App.toast('Add an active staff member first.', 'warn'); return; }
+      App.modal({
+        title: 'New task', wide: true,
+        body: taskFormBody(null, staff, 'create'),
+        onOpen: function (root) { wireAllocPreview(root, 'create', ''); },
+        actions: [
+          { label: 'Cancel' },
+          submit('Create task', function (c) {
+            var v = c.values();
+            var assignTo = Array.prototype.slice.call(
+              c.root.querySelectorAll('input[name="assignTo"]:checked')).map(function (x) { return x.value; });
+            if (!(v.title && v.title.trim())) { App.toast('Enter a title.', 'warn'); return; }
+            if (!assignTo.length) { App.toast('Select at least one person.', 'warn'); return; }
+            return App.api('api_taskCreate', {
+              title: v.title, description: v.description, taskType: v.taskType, priority: v.priority,
+              startDate: v.startDate, dueDate: v.dueDate, amountAllocated: v.amountAllocated, assignTo: assignTo
+            }).then(function () {
+              App.closeModal();
+              App.toast(assignTo.length > 1 ? ('Created for ' + assignTo.length + ' staff.') : 'Task created.', 'good');
+              App.refresh();
+            });
+          })
+        ]
+      });
+    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  function openTaskEdit(task) {
+    loadAssignable().then(function (staff) {
+      App.modal({
+        title: 'Edit task', wide: true,
+        body: taskFormBody(task, staff, 'edit'),
+        onOpen: function (root) { wireAllocPreview(root, 'edit', task.taskId); },
+        actions: [
+          { label: 'Cancel' },
+          submit('Save changes', function (c) {
+            var v = c.values();
+            if (!(v.title && v.title.trim())) { App.toast('Enter a title.', 'warn'); return; }
+            return App.api('api_taskUpdate', {
+              taskId: task.taskId, title: v.title, description: v.description, priority: v.priority,
+              taskType: v.taskType, amountAllocated: v.amountAllocated, startDate: v.startDate,
+              dueDate: v.dueDate, assignedTo: v.assignedTo
+            }).then(function () { App.closeModal(); App.toast('Task updated.', 'good'); App.refresh(); });
+          })
+        ]
+      });
+    });
+  }
+
+  function openTaskDetail(id) {
+    App.busy(true);
+    App.api('api_taskDetail', id).then(function (d) {
+      App.busy(false);
+      var t = d.task; _tasks[t.taskId] = t;
+      var al = d.allocation;
+
+      var summary = '' +
+        '<div class="grid g-2" style="gap:14px">' +
+          '<div>' +
+            '<div class="wrap" style="margin-bottom:10px">' + UI.taskPill(t.status) + ' ' + UI.priorityPill(t.priority) +
+              ' ' + UI.pill(t.taskType, 'outline') +
+              (t.isPriority ? ' ' + UI.pill('Priority', 'red') : '') +
+              (t.overdue ? ' ' + UI.pill('Overdue', 'red') : '') + '</div>' +
+            '<div class="li-sub">Assignee</div><div class="li-title" style="margin-bottom:8px">' + esc(t.assignedToName) + '</div>' +
+            '<div class="li-sub">Due</div><div class="li-title" style="margin-bottom:8px">' + esc(t.dueLabel || t.dueDate || '—') +
+              (t.rolloverCount ? ' · rolled over ' + t.rolloverCount + '×' : '') + '</div>' +
+            (t.description ? '<div class="li-sub">Description</div><div style="margin-bottom:8px">' + esc(t.description) + '</div>' : '') +
+          '</div>' +
+          '<div>' +
+            UI.kpi({ label: 'Reported', value: UI.pct(t.reportedProgress) }) + spacer(10) +
+            UI.kpi({ label: 'Validated (pays)', value: UI.pct(t.validatedProgress),
+              foot: money(t.payable) + ' earned of ' + money(t.amountAllocated) }) +
+          '</div>' +
+        '</div>' +
+        (al && al.enabled && al.guaranteed
+          ? '<div class="notice mt small"><div><b>Allocation</b> — ' + money(al.share) + ' of ' +
+            esc(t.assignedToName) + '’s ' + money(al.guaranteed) + ' guarantee for ' + esc(al.monthLabel) +
+            ', shared across ' + al.taskCount + ' task' + (al.taskCount === 1 ? '' : 's') + ' due that month' +
+            (al.mode === 'Weighted' ? ' (weighted by priority)' : '') + '. ' +
+            money(al.payable) + ' earned at ' + UI.pct(t.effectiveProgress) + ' validated completion.' +
+            (al.locked ? ' This month’s payroll is already approved or paid, so the share is frozen.' : '') +
+            '</div></div>'
+          : '') +
+        (t.adminComment ? '<div class="notice mt small"><div><b>Last note:</b> ' + esc(t.adminComment) + '</div></div>' : '');
+
+      var reps = (d.reports || []).length ? d.reports.map(function (r) {
+        return '<div class="list-item flat"><div style="flex:1;min-width:0">' +
+          '<div class="li-title">' + esc(r.reportDate) + ' · ' + UI.pct(r.progressPercent) + ' ' +
+          (r.onTime ? UI.pill('On time', 'green') : UI.pill('Late', 'amber')) + ' ' + UI.reviewPill(r.reviewStatus) + '</div>' +
+          '<div class="li-sub">' + esc(r.reportText) + '</div>' +
+          (r.blockers ? '<div class="li-sub">⛔ ' + esc(r.blockers) + '</div>' : '') +
+          '</div></div>';
+      }).join('') : UI.empty('📝', 'No daily reports yet');
+
+      var docs = (d.documents || []).length ? d.documents.map(function (u) {
+        return '<div class="file-row"><span class="file-ico">📄</span>' +
+          '<div style="flex:1;min-width:0"><strong>' + esc(u.fileName) + '</strong>' +
+          '<div class="muted small">' + esc(u.category) + ' · ' + u.sizeKb + ' KB · ' + esc(u.uploadedAt) + '</div></div>' +
+          '<a class="btn xs" href="' + esc(u.url) + '" target="_blank" rel="noopener">Open</a></div>';
+      }).join('') : '<div class="muted small">No documents attached.</div>';
+
+      var actions = [{ label: 'Close' }];
+      if (t.status === 'PendingValidation') {
+        actions.unshift({ label: 'Reject', tone: 'danger', close: false, onClick: function () { openReject(t); } });
+        actions.unshift({ label: 'Validate', tone: 'brand', close: false, onClick: function () { openValidate(t); } });
+      } else if (t.status !== 'Completed' && t.status !== 'Failed' && t.status !== 'Cancelled') {
+        actions.unshift({ label: 'Upload file', close: false, onClick: function () { App.openUpload({ taskId: t.taskId, taskTitle: t.title }); } });
+        actions.unshift({ label: 'Edit', tone: 'brand', close: false, onClick: function () { openTaskEdit(t); } });
+      }
+      // A failed task can be reassigned (and reactivated) to another staff
+      // member; any open task can simply change hands.
+      if (t.status !== 'Completed' && t.status !== 'Cancelled') {
+        actions.unshift({ label: t.status === 'Failed' ? 'Reassign / retry' : 'Reassign',
+          close: false, onClick: function () { openReassign(t); } });
+      }
+
+      App.modal({
+        title: t.title, wide: true,
+        body: summary + spacer(14) +
+          UI.card({ title: 'Daily reports', className: 'tight', body: reps }) + spacer(12) +
+          UI.card({ title: 'Documents', className: 'tight', body: docs }),
+        actions: actions
+      });
+    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  function openValidate(task) {
+    App.modal({
+      title: 'Validate — ' + task.title,
+      body: '' +
+        '<p class="muted small">Staff reported <b>' + UI.pct(task.reportedProgress) +
+          '</b>. Set the completion percentage you are validating — that is what pays.</p>' +
+        field('Validated progress %',
+          '<input type="number" data-field="validatedProgress" data-type="number" min="0" max="100" value="' + (task.reportedProgress || 0) + '">') +
+        '<div class="form-2">' +
+          field('Quality rating (0–100)',
+            '<input type="number" data-field="rating" data-type="number" min="0" max="100" value="' + (task.adminRating != null ? task.adminRating : 80) + '">') +
+          field('Close out',
+            '<label class="check" style="margin-top:8px"><input type="checkbox" data-field="markComplete" checked> <span>Mark task completed</span></label>') +
+        '</div>' +
+        field('Comment to staff', '<textarea data-field="comment" placeholder="Optional feedback">' + esc(task.adminComment || '') + '</textarea>') +
+        '<div class="hint">Unticking “Mark task completed” records partial validated progress and returns the task to In progress, so the staff member keeps earning toward the balance.</div>',
+      actions: [
+        { label: 'Cancel' },
+        { label: 'Reject instead', tone: 'danger', close: false, onClick: function () { openReject(task); } },
+        submit('Save validation', function (c) {
+          var v = c.values();
+          return App.api('api_taskValidate', {
+            taskId: task.taskId, validatedProgress: v.validatedProgress, rating: v.rating,
+            comment: v.comment, markComplete: v.markComplete
+          }).then(function (r) {
+            App.closeModal();
+            App.toast('Validated ' + UI.pct(r.validatedProgress) + ' · ' + money(r.payableAmount) + ' earned.', 'good');
+            App.refresh();
+          });
+        })
+      ]
+    });
+  }
+
+  function openReject(task) {
+    App.modal({
+      title: 'Reject — ' + task.title,
+      body: '<p class="muted small">This returns the task to <b>In progress</b> with no pay released.</p>' +
+        field('Reason / what to fix', '<textarea data-field="comment" placeholder="Explain what needs rework"></textarea>'),
+      actions: [
+        { label: 'Cancel' },
+        submit('Reject & return', function (c) {
+          var v = c.values();
+          if (!(v.comment && v.comment.trim())) { App.toast('Add a short reason.', 'warn'); return; }
+          return App.api('api_taskReject', { taskId: task.taskId, comment: v.comment })
+            .then(function () { App.closeModal(); App.toast('Sent back for rework.', 'good'); App.refresh(); });
+        }, 'danger')
+      ]
+    });
+  }
+
+  function openReassign(task) {
+    if (!task) return;
+    var willReactivate = task.status === 'Failed' || task.status === 'Completed';
+    App.busy(true);
+    loadAssignable().then(function (list) {
+      App.busy(false);
+      var options = (list || []).filter(function (s) {
+        return s.staffId !== task.assignedTo;
+      }).map(function (s) { return { value: s.staffId, label: s.name + (s.department ? ' · ' + s.department : '') }; });
+      if (!options.length) { App.toast('No other active staff to reassign to.', 'warn'); return; }
+      var today = App.state.config.today;
+      App.modal({
+        title: 'Reassign — ' + task.title,
+        body:
+          '<div class="li-sub" style="margin-bottom:8px">Currently assigned to <b>' + esc(task.assignedToName) +
+            '</b> · ' + UI.taskPill(task.status) + '</div>' +
+          field('Reassign to', '<select data-field="staffId">' + opt(options) + '</select>') +
+          field('New due date', '<input type="date" data-field="dueDate" value="' + esc(today) + '">',
+            'The new owner’s deadline. Handy when reactivating a task whose date has passed.') +
+          '<label class="check" style="margin-top:6px"><input type="checkbox" data-field="reactivate"' +
+            (willReactivate ? ' checked' : '') +
+            '><span>Reactivate — reset progress and start fresh for the new owner</span></label>' +
+          (willReactivate
+            ? '<div class="notice small" style="margin-top:8px">This task is <b>' + esc(task.status) +
+              '</b>. Reassigning sets it back to <b>Assigned</b> for the new owner.</div>'
+            : ''),
+        actions: [
+          { label: 'Cancel' },
+          submit('Reassign', function (c) {
+            var v = c.values();
+            if (!v.staffId) { App.toast('Choose a staff member.', 'warn'); return; }
+            return App.api('api_taskReassign', {
+              taskId: task.taskId, staffId: v.staffId, dueDate: v.dueDate, reactivate: !!v.reactivate
+            }).then(function (r) {
+              App.closeModal();
+              App.toast('Task reassigned to ' + (r.assignedToName || 'staff') +
+                (r.reactivated ? ' and reactivated.' : '.'), 'good');
+              App.refresh();
+            });
+          })
+        ]
+      });
+    }).catch(function (e) { App.busy(false); App.toast(e && e.message ? e.message : String(e), 'bad'); });
+  }
+
+  function reviewReport(reportId, decision) {
+    if (decision === 'Approved') {
+      return App.api('api_dailyReportReview', { reportId: reportId, decision: 'Approved', comment: '' })
+        .then(function () { App.toast('Report approved.', 'good'); App.refresh(); })
+        .catch(function (e) { App.toast(e.message, 'bad'); });
+    }
+    App.confirm({
+      title: 'Reject daily report', message: 'Send this report back to the staff member?',
+      note: true, noteLabel: 'Reason', requireNote: true, confirmLabel: 'Reject', tone: 'danger'
+    }).then(function (note) {
+      if (note === null) return;
+      App.api('api_dailyReportReview', { reportId: reportId, decision: 'Rejected', comment: note })
+        .then(function () { App.toast('Report rejected.', 'good'); App.refresh(); })
+        .catch(function (e) { App.toast(e.message, 'bad'); });
+    });
+  }
+
+  /* ======================================================================
+     STAFF MODALS
+     ====================================================================== */
+  function staffFormBody(s) {
+    var roles = ['Staff', 'Manager', 'Admin']; s = s || {};
+    var cfg = App.state.config || {};
+    var salary = s.monthlySalary != null && s.monthlySalary !== ''
+      ? s.monthlySalary
+      : (cfg.defaultMonthlySalary || '');
+    return '' +
+      '<div class="form-2">' +
+        field('Full name', '<input type="text" data-field="name" value="' + esc(s.name || '') + '" placeholder="Jane Doe">') +
+        field('Work email', '<input type="email" data-field="email" value="' + esc(s.email || '') + '" placeholder="jane@company.com">') +
+      '</div>' +
+      '<div class="form-2">' +
+        field('Role', '<select data-field="role">' + opt(roles, s.role || 'Staff') + '</select>') +
+        field('Phone', '<input type="text" data-field="phone" value="' + esc(s.phone || '') + '" placeholder="Optional">') +
+      '</div>' +
+      '<div class="form-2">' +
+        field('Department', '<input type="text" data-field="department" value="' + esc(s.department || '') + '" placeholder="e.g. Operations">') +
+        field('Position', '<input type="text" data-field="position" value="' + esc(s.position || '') + '" placeholder="e.g. Analyst">') +
+      '</div>' +
+      field('Guaranteed monthly salary (' + esc(cfg.currency || '') + ')',
+        '<input type="number" data-field="monthlySalary" data-type="number" min="0" step="0.01" value="' +
+        esc(salary) + '" placeholder="e.g. 30000">',
+        cfg.autoAllocateFromSalary === false
+          ? 'Recorded for reference. Automatic allocation is switched off, so task amounts are typed in per task.'
+          : 'This figure is shared across the tasks due in each month — one task carries all of it, four tasks carry a quarter each — and every task then pays out on its completion percentage.') +
+      field('Photo URL', '<input type="text" data-field="photoUrl" value="' + esc(s.photoUrl || '') + '" placeholder="Optional link to a photo">') +
+      (s.staffId ? '' : field('PIN (optional)',
+        '<input type="text" data-field="pin" inputmode="numeric" placeholder="Leave blank to auto-generate">',
+        'A 4–8 digit PIN for email + PIN sign-in. If blank, one is generated and shown to you.')) +
+      field('Notes', '<textarea data-field="notes" placeholder="Optional">' + esc(s.notes || '') + '</textarea>');
+  }
+
+  function pinModal(name, pin) {
+    App.modal({
+      title: 'Sign-in PIN',
+      body: '<div class="notice brand"><div><div class="n-title">' + esc(name) + '</div>' +
+        '<div class="n-body">Share this PIN for email + PIN sign-in: <b style="font-size:18px">' + esc(pin) + '</b></div></div></div>' +
+        '<p class="small muted mt">They can also sign in with Google if their Google address matches this email.</p>',
+      actions: [{ label: 'Done', tone: 'brand' }]
+    });
+  }
+
+  function openStaffCreate() {
+    App.modal({
+      title: 'Add staff member', wide: true, body: staffFormBody(null),
+      actions: [
+        { label: 'Cancel' },
+        submit('Create', function (c) {
+          var v = c.values();
+          if (!(v.name && v.name.trim())) { App.toast('Enter a name.', 'warn'); return; }
+          if (!(v.email && v.email.trim())) { App.toast('Enter an email.', 'warn'); return; }
+          return App.api('api_staffCreate', v).then(function (r) {
+            App.closeModal(); App.refresh();
+            if (r && r.pin) pinModal(v.name, r.pin); else App.toast('Staff member added.', 'good');
+          });
+        })
+      ]
+    });
+  }
+
+  function openStaffEdit(s) {
+    App.modal({
+      title: 'Edit — ' + s.name, wide: true, body: staffFormBody(s),
+      actions: [
+        { label: 'Cancel' },
+        submit('Save', function (c) {
+          var v = c.values(); v.staffId = s.staffId;
+          return App.api('api_staffUpdate', v).then(function () { App.closeModal(); App.toast('Saved.', 'good'); App.refresh(); });
+        })
+      ]
+    });
+  }
+
+  function openResetPin(s) {
+    App.confirm({ title: 'Reset PIN', message: 'Generate a new sign-in PIN for ' + s.name + '?', confirmLabel: 'Reset PIN' })
+      .then(function (ok) {
+        if (!ok) return;
+        App.api('api_resetPin', { staffId: s.staffId }).then(function (r) {
+          var pin = r && (r.pin || r.newPin);
+          if (pin) pinModal(s.name, pin); else App.toast('PIN reset.', 'good');
+        }).catch(function (e) { App.toast(e.message, 'bad'); });
+      });
+  }
+
+  function openSetStatus(s) {
+    App.modal({
+      title: 'Set status — ' + s.name,
+      body: field('Status', '<select data-field="status">' + opt(['Active', 'Inactive', 'Suspended'], s.status) + '</select>') +
+        field('Note', '<textarea data-field="note" placeholder="Reason (recorded)"></textarea>') +
+        '<div class="hint">Suspending here is a manual status change. Strike-driven suspensions come from the 3-strike rule — use “Clear record” to lift those.</div>',
+      actions: [
+        { label: 'Cancel' },
+        submit('Apply', function (c) {
+          var v = c.values();
+          return App.api('api_staffSetStatus', { staffId: s.staffId, status: v.status, note: v.note })
+            .then(function () { App.closeModal(); App.toast('Status updated.', 'good'); App.refresh(); });
+        })
+      ]
+    });
+  }
+
+  function clearRecord(staffId, name) {
+    App.confirm({
+      title: 'Clear strike record',
+      message: 'Lift ' + name + '’s active strikes and any suspension. Their lifetime strike and suspension counts stay on record permanently.',
+      note: true, noteLabel: 'Clearance note', requireNote: true,
+      notePlaceholder: 'Why is the record being cleared?', confirmLabel: 'Clear & reinstate', tone: 'brand'
+    }).then(function (note) {
+      if (note === null) return;
+      App.api('api_clearStrikes', { staffId: staffId, note: note })
+        .then(function () { App.toast('Record cleared — staff reinstated. History retained.', 'good'); App.refresh(); })
+        .catch(function (e) { App.toast(e.message, 'bad'); });
+    });
+  }
+
+  function suspendStaff(staffId, name) {
+    App.confirm({
+      title: 'Suspend staff', message: 'Manually suspend ' + name + '? They will be blocked from acting until cleared.',
+      note: true, noteLabel: 'Reason', requireNote: true, confirmLabel: 'Suspend', tone: 'danger'
+    }).then(function (note) {
+      if (note === null) return;
+      App.api('api_suspendStaff', { staffId: staffId, reason: note })
+        .then(function () { App.toast('Staff suspended.', 'good'); App.refresh(); })
+        .catch(function (e) { App.toast(e.message, 'bad'); });
+    });
+  }
+
+  // Requirement 9: "remove" never deletes — it flags the account Inactive so the
+  // full record (tasks, attendance, pay, discipline) is kept for future reference.
+  function removeStaff(staffId, name) {
+    App.confirm({
+      title: 'Remove ' + name,
+      message: 'Take ' + name + ' off the active roster. Their record — tasks, attendance, ' +
+        'pay and discipline history — is <b>kept on file</b>; the account is flagged ' +
+        '<b>Inactive</b>, not deleted, and can be restored at any time.',
+      note: true, noteLabel: 'Reason (optional)', notePlaceholder: 'e.g. left the company',
+      confirmLabel: 'Remove staff', tone: 'danger'
+    }).then(function (note) {
+      if (note === null) return;
+      App.api('api_staffSetStatus', { staffId: staffId, status: 'Inactive', note: note || 'Removed from roster' })
+        .then(function () { App.toast(name + ' removed — record kept on file (Inactive).', 'good'); App.refresh(); })
+        .catch(function (e) { App.toast(e.message, 'bad'); });
+    });
+  }
+
+  function restoreStaff(staffId, name) {
+    App.confirm({
+      title: 'Restore ' + name,
+      message: 'Reactivate ' + name + '? They will be able to sign in and be assigned work again.',
+      confirmLabel: 'Restore', tone: 'brand'
+    }).then(function (ok) {
+      if (!ok) return;
+      App.api('api_staffSetStatus', { staffId: staffId, status: 'Active', note: 'Restored to roster' })
+        .then(function () { App.toast(name + ' restored to Active.', 'good'); App.refresh(); })
+        .catch(function (e) { App.toast(e.message, 'bad'); });
+    });
+  }
+
+  /* ======================================================================
+     DISCIPLINE / ATTENDANCE / PAYROLL MODALS
+     ====================================================================== */
+  function openIssueStrike() {
+    App.busy(true);
+    App.api('api_staffList').then(function (list) {
+      App.busy(false);
+      var active = list.filter(function (s) { return s.status !== 'Inactive'; });
+      if (!active.length) { App.toast('No staff to strike.', 'warn'); return; }
+      App.modal({
+        title: 'Issue a strike',
+        body: field('Staff member', '<select data-field="staffId">' +
+            opt(active.map(function (s) { return { value: s.staffId, label: s.name + ' (' + s.strikeCount + ' active)' }; })) + '</select>') +
+          field('Reason', '<textarea data-field="reason" placeholder="What happened?"></textarea>') +
+          '<div class="hint">Three active strikes (Config: StrikeLimit) suspends the account automatically.</div>',
+        actions: [
+          { label: 'Cancel' },
+          submit('Issue strike', function (c) {
+            var v = c.values();
+            if (!(v.reason && v.reason.trim())) { App.toast('Add a reason.', 'warn'); return; }
+            return App.api('api_strikeIssue', { staffId: v.staffId, reason: v.reason })
+              .then(function () { App.closeModal(); App.toast('Strike issued.', 'good'); App.refresh(); });
+          }, 'danger')
+        ]
+      });
+    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  function openAttendanceSet(staffId, name) {
+    // Requirement 4: OnTime / Late / Absent are set automatically from the
+    // sign-in time and the nightly sweep. Admins may only record Leave or Holiday.
+    var statuses = ['Leave', 'Holiday'];
+    var today = App.state.config.today;
+    var chooseStaff = !staffId;
+    var pre = chooseStaff ? App.api('api_staffList') : Promise.resolve(null);
+    pre.then(function (list) {
+      var staffField = chooseStaff
+        ? field('Staff member', '<select data-field="staffId">' +
+            opt((list || []).filter(function (s) { return s.status !== 'Inactive'; })
+              .map(function (s) { return { value: s.staffId, label: s.name }; })) + '</select>')
+        : '<input type="hidden" data-field="staffId" value="' + esc(staffId) + '">';
+      App.modal({
+        title: name ? ('Leave / Holiday — ' + name) : 'Record leave / holiday',
+        body: staffField +
+          '<div class="form-2">' +
+            field('Date', '<input type="date" data-field="date" value="' + esc(today) + '">') +
+            field('Status', '<select data-field="status">' + opt(statuses, 'Leave') + '</select>') +
+          '</div>' +
+          field('Note', '<textarea data-field="note" placeholder="Optional"></textarea>') +
+          '<div class="notice small" style="margin:8px 0 0">Present, Late and Absent are ' +
+          'decided automatically from each staff member’s sign-in time — they can’t be ' +
+          'set by hand. Use this only to record approved <b>Leave</b> or a <b>Holiday</b>.</div>',
+        actions: [
+          { label: 'Cancel' },
+          submit('Save', function (c) {
+            var v = c.values();
+            if (!v.staffId) { App.toast('Choose a staff member.', 'warn'); return; }
+            return App.api('api_attendanceSet', { staffId: v.staffId, date: v.date, status: v.status, note: v.note })
+              .then(function () { App.closeModal(); App.toast('Attendance updated.', 'good'); App.refresh(); });
+          })
+        ]
+      });
+    });
+  }
+
+  function openAttendanceLog(staffId, name) {
+    App.busy(true);
+    App.api('api_attendanceList', { staffId: staffId, periodType: App.period() }).then(function (rows) {
+      App.busy(false);
+      var body = (rows && rows.length) ? UI.table({
+        cols: [
+          { label: 'Date', render: function (a) { return esc(a.date); } },
+          { label: 'Status', render: function (a) { return UI.attPill(a.status); } },
+          { label: 'In', render: function (a) { return esc(a.loginTime || '—'); } },
+          { label: 'Out', render: function (a) { return esc(a.logoutTime || '—'); } },
+          { label: 'Late', align: 'right', render: function (a) { return a.minutesLate ? a.minutesLate + 'm' : '—'; } },
+          { label: 'Notes', render: function (a) { return esc(a.notes || ''); } }
+        ],
+        rows: rows,
+        searchFields: ['date', 'status', 'notes'],
+        empty: 'No sign-ins'
+      }) : UI.empty('🗓️', 'No sign-ins', 'Nothing recorded for ' + App.periodLabel(App.period()));
+      App.modal({
+        title: (name || 'Staff') + ' — attendance',
+        sub: App.periodLabel(App.period()),
+        wide: true,
+        body: body,
+        actions: [{ label: 'Close' }]
+      });
+    }).catch(function (e) { App.busy(false); App.toast(e && e.message ? e.message : String(e), 'bad'); });
+  }
+
+  function runPayroll() {
+    var period = App.period();
+    App.confirm({
+      title: 'Run payroll',
+      message: 'Generate / refresh draft payroll for ' + App.periodLabel(period) + '? Approved and paid rows are left untouched.',
+      confirmLabel: 'Run payroll'
+    }).then(function (ok) {
+      if (!ok) return;
+      App.busy(true);
+      App.api('api_payrollRun', { periodType: period }).then(function (r) {
+        App.busy(false);
+        App.toast('Payroll ready — ' + r.created + ' created, ' + r.updated + ' updated, ' + r.locked + ' locked.', 'good');
+        App.refresh();
+      }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+    });
+  }
+
+  function openAdjust(row) {
+    if (!row) return;
+    App.modal({
+      title: 'Adjust — ' + row.staffName,
+      body: field('Adjustment amount',
+          '<input type="number" data-field="amount" data-type="number" step="0.01" value="' + (row.adjustments || 0) + '">',
+          'Positive for a bonus, negative for a deduction. Replaces any existing adjustment.') +
+        field('Note', '<textarea data-field="note" placeholder="Why?"></textarea>'),
+      actions: [
+        { label: 'Cancel' },
+        submit('Save adjustment', function (c) {
+          var v = c.values();
+          return App.api('api_payrollAdjust', { payrollId: row.payrollId, amount: v.amount, note: v.note })
+            .then(function () { App.closeModal(); App.toast('Adjustment saved.', 'good'); App.refresh(); });
+        })
+      ]
+    });
+  }
+
+  function approveRow(payrollId) {
+    App.confirm({ title: 'Approve pay', message: 'Approve this payroll row for payment?', confirmLabel: 'Approve' })
+      .then(function (ok) {
+        if (!ok) return;
+        App.api('api_payrollApprove', { payrollId: payrollId })
+          .then(function () { App.toast('Approved.', 'good'); App.refresh(); })
+          .catch(function (e) { App.toast(e.message, 'bad'); });
+      });
+  }
+
+  function openMarkPaid(row) {
+    if (!row) return;
+    App.modal({
+      title: 'Mark paid — ' + row.staffName,
+      body: '<p class="muted small">Net payable <b>' + money(row.netPay) + '</b>.</p>' +
+        field('Payment reference', '<input type="text" data-field="reference" placeholder="e.g. bank transfer ref">'),
+      actions: [
+        { label: 'Cancel' },
+        submit('Mark paid', function (c) {
+          var v = c.values();
+          return App.api('api_payrollMarkPaid', { payrollId: row.payrollId, reference: v.reference })
+            .then(function () { App.closeModal(); App.toast('Marked paid.', 'good'); App.refresh(); });
+        })
+      ]
+    });
+  }
+
+  function exportReport(format, staffId) {
+    App.busy(true);
+    App.api('api_reportExport', { format: format, periodType: App.period(), staffId: staffId || '' })
+      .then(function (r) {
+        App.busy(false);
+        if (r && r.url) { App.download(r.url); App.toast('Export ready — opening…', 'good'); }
+        else App.toast('Export created.', 'good');
+      }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  /* ======================================================================
+     SHARED RENDER SNIPPETS
+     ====================================================================== */
+  function taskListItem(t) {
+    var badge = t.status === 'PendingValidation'
+      ? ('Submitted ' + (t.submittedAt || ''))
+      : ('Due ' + (t.dueLabel || t.dueDate || '—'));
+    return '<div class="list-item flat" data-search="' + esc((t.title || '') + ' ' + (t.assignedToName || '')) +
+      '" style="cursor:pointer" data-act="task" data-id="' + esc(t.taskId) + '">' +
+      '<div style="flex:1;min-width:0">' +
+        '<div class="li-title">' + esc(t.title) +
+          (t.isPriority ? ' ' + UI.pill('Priority', 'red') : '') +
+          (t.overdue ? ' ' + UI.pill('Overdue', 'red') : '') + '</div>' +
+        '<div class="li-sub">' + esc(t.assignedToName) + ' · ' + esc(t.taskType) + ' · ' + esc(badge) + '</div>' +
+      '</div>' +
+      '<div class="right" style="min-width:96px"><div>' + money(t.amountAllocated) + '</div>' +
+        '<div class="li-sub">' + UI.pct(t.effectiveProgress) + ' paid</div></div>' +
+      '</div>';
+  }
+
+  function bucketCard(key, tasks) {
+    var meta = {
+      completed: { icon: '✅', title: 'Completed', view: 'tasks' },
+      pending: { icon: '🕵️', title: 'Yet to validate', view: 'validation' },
+      inProgress: { icon: '🔧', title: 'In progress', view: 'tasks' }
+    }[key];
+    var body = tasks.length ? tasks.slice(0, 6).map(taskListItem).join('') : UI.empty('—', 'Nothing here');
+    var more = tasks.length > 6 ? actBtn('View all ' + tasks.length, 'go', meta.view) : '';
+    return UI.card({
+      title: meta.icon + ' ' + meta.title,
+      sub: tasks.length + ' task' + (tasks.length === 1 ? '' : 's'),
+      actions: more, body: body
+    });
+  }
+
+  /* ======================================================================
+     VIEWS
+     ====================================================================== */
+  var views = {};
+
+  /* ---------- Dashboard ---------- */
+  views.dashboard = {
+    title: 'Dashboard',
+    sub: function () { return 'Overview · ' + App.periodLabel(App.period()); },
+    render: function (mount) {
+      return App.api('api_adminDashboard', { periodType: App.period() }).then(function (d) {
+        App.setUnread(d.unread);
+        App.setBadge('validation', d.buckets.pending.length);
+        App.setBadge('discipline', d.staffStats.flagged);
+        remember(d.buckets.completed); remember(d.buckets.pending); remember(d.buckets.inProgress);
+
+        var b = d.board;
+        var kpis = UI.grid('g-4', [
+          UI.kpi({ label: 'Completed', value: b.completed, icon: '✅', foot: 'of ' + b.total + ' active tasks' }),
+          '<div data-act="go" data-id="validation" style="cursor:pointer">' +
+            UI.kpi({ label: 'Yet to validate', value: b.pending, icon: '🕵️', foot: 'Awaiting your sign-off' }) + '</div>',
+          UI.kpi({ label: 'In progress', value: b.inProgress, icon: '🔧', foot: b.overdue + ' overdue · ' + b.priority + ' priority' }),
+          '<div data-act="go" data-id="payroll" style="cursor:pointer">' +
+            UI.kpi({ label: 'Net payable', value: money(d.payroll.net), icon: '💰', dark: true,
+                     foot: d.payroll.guaranteed
+                       ? UI.pct(d.payroll.guaranteeRate) + ' of a ' + money(d.payroll.guaranteed) +
+                         ' guaranteed bill · ' + d.payroll.periodLabel
+                       : d.payroll.periodLabel }) + '</div>'
+        ].join(''));
+
+        var charts = UI.grid('g-2-1',
+          UI.card({ title: 'Task activity', sub: d.period.label, body: UI.barChart(d.analytics.series, { money: true }) }) +
+          UI.card({ title: 'Completion mix', sub: 'This period', body: UI.gauge(d.analytics.gauge) }));
+
+        var buckets = UI.grid('g-3',
+          bucketCard('completed', d.buckets.completed) +
+          bucketCard('pending', d.buckets.pending) +
+          bucketCard('inProgress', d.buckets.inProgress));
+
+        var att = d.attendanceToday;
+        var attBody = '<div class="wrap" style="margin-bottom:10px">' +
+          UI.pill('On time ' + att.onTime, 'green') + ' ' + UI.pill('Late ' + att.late, 'amber') + ' ' +
+          UI.pill('Absent ' + att.absent, 'red') + ' ' + UI.pill('Not signed ' + att.notSigned, 'grey') + '</div>' +
+          (att.rows.length ? att.rows.slice(0, 8).map(function (r) {
+            return '<div class="list-item flat">' + UI.avatar({ name: r.name, photoUrl: r.photoUrl }, 'sm') +
+              '<div style="flex:1;min-width:0"><div class="li-title">' + esc(r.name) + '</div>' +
+              '<div class="li-sub">' + esc(r.department || '') + '</div></div>' +
+              '<div class="right">' + UI.attPill(r.status) +
+              (r.loginTime ? '<div class="li-sub">' + esc(r.loginTime) + (r.minutesLate ? ' · +' + r.minutesLate + 'm' : '') + '</div>' : '') +
+              '</div></div>';
+          }).join('') : UI.empty('🕘', 'No staff yet'));
+
+        var flaggedBody = d.flagged.length ? d.flagged.map(function (s) {
+          return '<div class="list-item flat">' + UI.avatar(s, 'sm') +
+            '<div style="flex:1;min-width:0"><div class="li-title">' + esc(s.name) + ' ' + UI.staffPill(s.status) + '</div>' +
+            '<div class="li-sub">' + s.strikeCount + ' active · ' + s.totalStrikesIssued + ' lifetime · ' + s.suspensionCount + ' suspension(s)</div></div>' +
+            actBtn('Clear', 'clear', s.staffId, 'btn-brand') + '</div>';
+        }).join('') : UI.empty('✅', 'No flagged staff', 'Everyone is in good standing');
+
+        var people = UI.grid('g-2-1',
+          UI.card({ title: 'Attendance today', sub: att.date, actions: actBtn('Open', 'go', 'attendance'), body: attBody }) +
+          UI.card({ title: 'Flagged & suspended', sub: d.staffStats.flagged + ' flagged', actions: actBtn('Manage', 'go', 'discipline'), body: flaggedBody }));
+
+        var perfTable = UI.table({
+          cols: [
+            { label: 'Staff', render: function (r) {
+              return '<div class="row-gap">' + UI.avatar(r, 'sm') +
+                '<div><div class="li-title">' + esc(r.name) + '</div><div class="li-sub">' + esc(r.department || r.role) + '</div></div></div>';
+            } },
+            { label: 'Completion', render: function (r) {
+              return '<div style="min-width:120px">' + UI.progress(r.completionRate) +
+                '<div class="li-sub">' + UI.pct(r.completionRate) + ' · ' + r.completed + '/' + r.assigned + '</div></div>';
+            } },
+            { label: 'Earned', align: 'right', render: function (r) { return money(r.earned); } }
+          ],
+          rows: d.performance.slice(0, 6), empty: 'No staff activity'
+        });
+
+        var reps = d.dailyReportsToday;
+        var repsBody = reps.length ? reps.slice(0, 8).map(function (r) {
+          return '<div class="list-item flat"><div style="flex:1;min-width:0">' +
+            '<div class="li-title">' + esc(r.staffName) + ' · ' + esc(r.taskTitle) + ' ' +
+            (r.onTime ? UI.pill('On time', 'green') : UI.pill('Late', 'amber')) + ' ' + UI.reviewPill(r.reviewStatus) + '</div>' +
+            '<div class="li-sub">' + esc(r.reportText) + '</div></div>' +
+            (r.reviewStatus === 'Pending'
+              ? '<div class="row-gap">' + actBtn('Approve', 'rep-ok', r.reportId, 'btn-brand') + actBtn('Reject', 'rep-no', r.reportId, 'btn-ghost') + '</div>'
+              : '') + '</div>';
+        }).join('') : UI.empty('📝', 'No daily reports today');
+
+        var bottom = UI.grid('g-2',
+          UI.card({ title: 'Top performers', sub: d.period.label, body: perfTable }) +
+          UI.card({ title: 'Daily reports today', sub: reps.length + ' filed', actions: actBtn('Review all', 'go', 'validation'), body: repsBody }));
+
+        mount.innerHTML = kpis + spacer() + charts + spacer() + buckets + spacer() + people + spacer() + bottom;
+
+        bind(mount, {
+          go: function (id) { App.setView(id); },
+          task: function (id) { openTaskDetail(id); },
+          clear: function (id) { var s = d.flagged.find(function (x) { return x.staffId === id; }); clearRecord(id, s ? s.name : 'this staff member'); },
+          'rep-ok': function (id) { reviewReport(id, 'Approved'); },
+          'rep-no': function (id) { reviewReport(id, 'Rejected'); }
+        });
+      });
+    }
+  };
+
+  /* ---------- Tasks ---------- */
+  views.tasks = {
+    title: 'Tasks', sub: 'Everything assigned across the team',
+    render: function (mount) {
+      return App.api('api_taskList', {}).then(function (list) {
+        remember(list);
+        var tab = 'all';
+        var tabs = [['all', 'All'], ['inProgress', 'In progress'], ['pending', 'Yet to validate'],
+          ['completed', 'Completed'], ['scheduled', 'Scheduled'], ['failed', 'Failed']];
+        function match(t) {
+          if (tab === 'all') return true;
+          if (tab === 'scheduled') return t.status === 'Scheduled';
+          if (tab === 'failed') return t.status === 'Failed';
+          return t.bucket === tab;
+        }
+        function draw() {
+          var rows = list.filter(match);
+          var table = Perf.paginatedTable({
+            pageSize: 50,
+            rows: rows,
+            cols: [
+              { label: 'Task', render: function (t) {
+                return '<div><div class="li-title">' + esc(t.title) + '</div><div class="li-sub">' +
+                  esc(t.taskType) + (t.isPriority ? ' · ' + UI.pill('Priority', 'red') : '') + '</div></div>';
+              } },
+              { label: 'Assignee', render: function (t) {
+                return '<div class="row-gap">' + UI.avatar({ name: t.assignedToName }, 'sm') + '<span>' + esc(t.assignedToName) + '</span></div>';
+              } },
+              { label: 'Priority', render: function (t) { return UI.priorityPill(t.priority); } },
+              { label: 'Due', render: function (t) {
+                return esc(t.dueLabel || t.dueDate || '—') + (t.overdue ? ' ' + UI.pill('Overdue', 'red') : '');
+              } },
+              { label: 'Progress', render: function (t) {
+                // Requirement 3 — the staff member's own reported % next to the
+                // validated one, so an admin sees progress as it is submitted.
+                return '<div style="min-width:130px">' + UI.progress(t.reportedProgress) +
+                  '<div class="li-sub">Reported ' + UI.pct(t.reportedProgress) +
+                  ' · validated ' + UI.pct(t.validatedProgress) + '</div>' +
+                  '<div class="li-sub">' + money(t.payable) + '</div></div>';
+              } },
+              { label: 'Status', render: function (t) {
+                return UI.taskPill(t.status) +
+                  (t.status === 'Assigned' && !t.acknowledged ? '<div class="li-sub">Not acknowledged</div>' : '') +
+                  (t.acknowledged && t.status !== 'Completed' ? '<div class="li-sub">Received by staff</div>' : '');
+              } },
+              { label: '', align: 'right', render: function (t) {
+                var a = actBtn('View', 'task', t.taskId);
+                if (t.status === 'PendingValidation') a += ' ' + actBtn('Validate', 'validate', t.taskId, 'btn-brand');
+                else if (t.status !== 'Completed' && t.status !== 'Failed' && t.status !== 'Cancelled') a += ' ' + actBtn('Edit', 'edit', t.taskId);
+                // A failed task can be reactivated onto someone new; open tasks can change hands.
+                if (t.status === 'Failed') a += ' ' + actBtn('Reassign', 'reassign', t.taskId, 'btn-brand');
+                else if (t.status !== 'Completed' && t.status !== 'Cancelled') a += ' ' + actBtn('Reassign', 'reassign', t.taskId);
+                a += ' ' + actBtn('File', 'file', t.taskId);
+                return a;
+              } }
+            ],
+            searchFields: ['title', 'assignedToName', 'taskType'],
+            empty: 'No tasks in this view'
+          });
+          mount.querySelector('#taskTable').innerHTML = table;
+          Perf.wirePaginatedTable(mount.querySelector('#taskTable'));
+          mount.querySelectorAll('#taskTabs button').forEach(function (bt) {
+            bt.classList.toggle('active', bt.getAttribute('data-tab') === tab);
+          });
+        }
+        var tableContainer = '<div class="card" id="taskTable"></div>';
+        mount.innerHTML = '<div class="spread" style="margin-bottom:14px">' +
+          '<div class="tabs" id="taskTabs">' + tabs.map(function (t) { return '<button data-tab="' + t[0] + '">' + esc(t[1]) + '</button>'; }).join('') + '</div>' +
+          '<button class="btn btn-brand" data-act="new">+ New task</button></div>' +
+          tableContainer;
+        mount.querySelectorAll('#taskTabs button').forEach(function (bt) {
+          bt.addEventListener('click', function () { tab = bt.getAttribute('data-tab'); draw(); });
+        });
+        draw();
+        bind(mount, {
+          new: function () { openTaskCreate(); },
+          task: function (id) { openTaskDetail(id); },
+          validate: function (id) { withTask(id).then(openValidate); },
+          edit: function (id) { withTask(id).then(openTaskEdit); },
+          reassign: function (id) { withTask(id).then(openReassign); },
+          // Requirement 6 — attach a document straight onto one task, and it
+          // lands on that task's assignee's Documents tab.
+          file: function (id) {
+            var t = list.find(function (x) { return x.taskId === id; }) || {};
+            App.openUpload({ taskId: id, taskTitle: t.title || '', staffId: t.assignedTo || '', staffName: t.assignedToName || '' });
+          }
+        });
+      });
+    }
+  };
+
+  /* ---------- Validation ---------- */
+  views.validation = {
+    title: 'Validation', sub: 'Approve completion % (releases pay) and review daily reports',
+    render: function (mount) {
+      return Promise.all([
+        App.api('api_taskList', { bucket: 'pending' }),
+        App.api('api_dailyReportList', { reviewStatus: 'Pending' })
+      ]).then(function (res) {
+        var tasks = res[0], reports = res[1]; remember(tasks);
+        App.setBadge('validation', tasks.length);
+
+        // PERF: Use lazy-loading pagination for large task lists
+        var tBody = tasks.length ? Perf.paginatedTable({
+          pageSize: 50,
+          rows: tasks,
+          cols: [
+            { label: 'Task', render: function (t) {
+              return '<div><div class="li-title">' + esc(t.title) + '</div><div class="li-sub">' +
+                esc(t.assignedToName) + ' · ' + esc(t.taskType) + '</div></div>';
+            } },
+            { label: 'Reported', render: function (t) {
+              return '<div style="min-width:110px">' + UI.progress(t.reportedProgress) +
+                '<div class="li-sub">' + UI.pct(t.reportedProgress) + ' claimed by staff</div></div>';
+            } },
+            { label: 'Submitted', render: function (t) { return esc(t.submittedAt || '—'); } },
+            { label: 'Worth', align: 'right', render: function (t) { return money(t.amountAllocated); } },
+            { label: '', align: 'right', render: function (t) {
+              return actBtn('View', 'task', t.taskId) + ' ' + actBtn('Validate', 'validate', t.taskId, 'btn-brand') +
+                ' ' + actBtn('Reject', 'reject', t.taskId, 'btn-ghost');
+            } }
+          ],
+          searchFields: ['title', 'assignedToName'],
+          empty: '🎉 Nothing waiting — All submitted work has been validated'
+        }) : UI.empty('🎉', 'Nothing waiting', 'All submitted work has been validated');
+
+        var rBody = reports.length ? reports.map(function (r) {
+          return '<div class="list-item"><div style="flex:1;min-width:0">' +
+            '<div class="li-title">' + esc(r.staffName) + ' · ' + esc(r.taskTitle) + '</div>' +
+            '<div class="li-sub">' + esc(r.reportDate) + ' · ' + UI.pct(r.progressPercent) + ' · ' + r.hoursSpent + 'h ' +
+            (r.onTime ? UI.pill('On time', 'green') : UI.pill('Late', 'amber')) + '</div>' +
+            '<div style="margin-top:4px">' + esc(r.reportText) + '</div>' +
+            (r.blockers ? '<div class="li-sub">⛔ ' + esc(r.blockers) + '</div>' : '') + '</div>' +
+            '<div class="row-gap">' + actBtn('Approve', 'rep-ok', r.reportId, 'btn-brand') + actBtn('Reject', 'rep-no', r.reportId, 'btn-ghost') + '</div></div>';
+        }).join('') : UI.empty('📝', 'No reports awaiting review');
+
+        mount.innerHTML =
+          '<div class="spread" style="margin-bottom:14px"><div class="wrap">' +
+          UI.pill('Approving a report raises the task’s validated % and its earnings', 'grey') +
+          '</div><div class="row-gap">' +
+          '<button class="btn" data-act="sync">Sync approved reports</button></div></div>' +
+          UI.card({ title: 'Tasks — yet to validate', sub: tasks.length + ' pending', body: tBody }) +
+          spacer() + UI.card({ title: 'Daily reports — pending review', sub: reports.length + ' pending', body: rBody });
+
+        bind(mount, {
+          task: function (id) { openTaskDetail(id); },
+          validate: function (id) { withTask(id).then(openValidate); },
+          reject: function (id) { withTask(id).then(openReject); },
+          'rep-ok': function (id) { reviewReport(id, 'Approved'); },
+          'rep-no': function (id) { reviewReport(id, 'Rejected'); },
+          sync: function () { syncApprovedReports(); }
+        });
+      });
+    }
+  };
+
+  /* ---------- Staff ---------- */
+  views.staff = {
+    title: 'Staff', sub: 'Add, edit, reset PINs and manage status',
+    render: function (mount) {
+      return App.api('api_staffList').then(function (list) {
+        _assignable = list.filter(function (s) { return s.status !== 'Inactive' && !s.suspended; });
+
+        // Active is the main list; suspended and removed are separate sections.
+        var groups = {
+          active: list.filter(function (s) { return s.status === 'Active'; }),
+          suspended: list.filter(function (s) { return s.status === 'Suspended'; }),
+          removed: list.filter(function (s) { return s.status === 'Inactive'; })
+        };
+        var counts = { all: list.length, active: groups.active.length,
+          suspended: groups.suspended.length, removed: groups.removed.length };
+        var filter = 'active';   // clickable KPI pills switch this
+
+        var staffCols = [
+          { label: 'Name', render: function (s) {
+            return '<div class="row-gap">' + UI.avatar(s, 'sm') +
+              '<div><div class="li-title">' + esc(s.name) + '</div><div class="li-sub">' + esc(s.email) + '</div></div></div>';
+          } },
+          { label: 'Role', render: function (s) { return esc(s.role) + (s.department ? '<div class="li-sub">' + esc(s.department) + '</div>' : ''); } },
+          { label: 'Status', render: function (s) { return UI.staffPill(s.status) + (s.flagged ? ' ' + UI.pill('Flagged', 'amber') : ''); } },
+          { label: 'Strikes', render: function (s) {
+            return s.strikeCount + ' active<div class="li-sub">' + s.totalStrikesIssued + ' lifetime · ' + s.suspensionCount + ' susp.</div>';
+          } },
+          { label: 'Tasks', render: function (s) {
+            return s.tasks.completed + '/' + s.tasks.total + '<div class="li-sub">' + s.tasks.pending + ' to validate</div>';
+          } },
+          { label: 'Guaranteed / month', align: 'right', render: function (s) {
+            return s.monthlySalary ? '<b>' + money(s.monthlySalary) + '</b>' : '<span class="muted">not set</span>';
+          } },
+          { label: 'Last login', render: function (s) { return esc(s.lastLogin || '—'); } },
+          { label: '', align: 'right', render: function (s) {
+            var a = actBtn('Edit', 'edit', s.staffId) + ' ' + actBtn('PIN', 'pin', s.staffId) + ' ' +
+              actBtn('Status', 'status', s.staffId) + ' ' + actBtn('Send file', 'sendfile', s.staffId);
+            if (s.flagged || s.suspended) a += ' ' + actBtn('Clear', 'clear', s.staffId, 'btn-brand');
+            a += ' ' + (s.status === 'Inactive'
+              ? actBtn('Restore', 'restore', s.staffId, 'btn-brand')
+              : actBtn('Remove', 'remove', s.staffId, 'btn-ghost'));
+            return a;
+          } }
+        ];
+
+        var makeTable = function (rows, emptyMsg) {
+          return Perf.paginatedTable({
+            pageSize: 50, rows: rows, cols: staffCols,
+            searchFields: ['name', 'email', 'department', 'role'],
+            empty: emptyMsg || 'No staff'
+          });
+        };
+
+        var pill = function (key, label, count) {
+          return '<button class="btn xs ' + (filter === key ? 'btn-brand' : 'outline') +
+            '" data-act="filter" data-id="' + key + '">' + esc(label) + ' ' + count + '</button>';
+        };
+
+        var wire = function () {
+          bind(mount, {
+            new: function () { openStaffCreate(); },
+            filter: function (key) { if (key && key !== filter) { filter = key; draw(); } },
+            edit: function (id) { openStaffEdit(list.find(function (s) { return s.staffId === id; })); },
+            pin: function (id) { openResetPin(list.find(function (s) { return s.staffId === id; })); },
+            status: function (id) { openSetStatus(list.find(function (s) { return s.staffId === id; })); },
+            clear: function (id) { var s = list.find(function (x) { return x.staffId === id; }); clearRecord(id, s ? s.name : 'staff'); },
+            sendfile: function (id) {
+              var s = list.find(function (x) { return x.staffId === id; }) || {};
+              App.openUpload({ staffId: id, staffName: s.name || id, visibility: 'Individual', category: 'General' });
+            },
+            remove: function (id) { var s = list.find(function (x) { return x.staffId === id; }); removeStaff(id, s ? s.name : 'staff'); },
+            restore: function (id) { var s = list.find(function (x) { return x.staffId === id; }); restoreStaff(id, s ? s.name : 'staff'); }
+          });
+        };
+
+        var draw = function () {
+          var ids = [];
+          var section = function (id, rows, emptyMsg) {
+            ids.push(id);
+            return '<div id="' + id + '">' + makeTable(rows, emptyMsg) + '</div>';
+          };
+          var bar = '<div class="spread" style="margin-bottom:14px"><div class="wrap">' +
+            pill('all', 'Total', counts.all) + ' ' +
+            pill('active', 'Active', counts.active) + ' ' +
+            pill('suspended', 'Suspended', counts.suspended) + ' ' +
+            pill('removed', 'Removed', counts.removed) +
+            '</div><button class="btn btn-brand" data-act="new">+ Add staff</button></div>';
+
+          var body;
+          if (filter === 'all') {
+            body = UI.card({ title: 'All staff', sub: counts.all + ' on record', body: section('stfAll', list) });
+          } else if (filter === 'suspended') {
+            body = UI.card({ title: 'Suspended staff', sub: counts.suspended + ' suspended · reinstating keeps the permanent record',
+              body: section('stfSusp', groups.suspended, 'Nobody is suspended') });
+          } else if (filter === 'removed') {
+            body = UI.card({ title: 'Removed staff', sub: counts.removed + ' removed · history is permanent',
+              body: section('stfRem', groups.removed, 'Nobody has been removed') });
+          } else {
+            // Default: active as the main list, with sections below for the rest.
+            body = UI.card({ title: 'Active staff', sub: counts.active + ' active', body: section('stfAct', groups.active, 'No active staff') }) +
+              spacer() + UI.card({ title: 'Suspended', sub: counts.suspended + ' suspended · reinstating keeps the permanent record',
+                body: section('stfSusp', groups.suspended, 'Nobody is suspended') }) +
+              spacer() + UI.card({ title: 'Removed', sub: counts.removed + ' removed · history is permanent',
+                body: section('stfRem', groups.removed, 'Nobody has been removed') });
+          }
+          mount.innerHTML = bar + body;
+          ids.forEach(function (id) { var el = mount.querySelector('#' + id); if (el) Perf.wirePaginatedTable(el); });
+          wire();
+        };
+
+        draw();
+      });
+    }
+  };
+
+  /* ---------- Attendance ---------- */
+  views.attendance = {
+    title: 'Attendance',
+    sub: function () { return 'Today’s roll-call and ' + App.periodLabel(App.period()) + ' history'; },
+    render: function (mount) {
+      return Promise.all([
+        App.api('api_attendanceBoard'),
+        App.api('api_attendanceSummary', { periodType: App.period() })
+      ]).then(function (res) {
+        var board = res[0], summary = res[1];
+        var rows = summary.rows || [];
+        var boardRows = board.rows.length ? board.rows.map(function (r) {
+          return '<div class="list-item flat">' + UI.avatar({ name: r.name, photoUrl: r.photoUrl }, 'sm') +
+            '<div style="flex:1;min-width:0"><div class="li-title">' + esc(r.name) + '</div>' +
+            '<div class="li-sub">' + esc(r.department || '') + '</div></div>' +
+            '<div class="right">' + UI.attPill(r.status) +
+            (r.loginTime ? '<div class="li-sub">' + esc(r.loginTime) + (r.minutesLate ? ' · +' + r.minutesLate + 'm' : '') + '</div>' : '') + '</div>' +
+            actBtn('Set', 'set', r.staffId) + '</div>';
+        }).join('') : UI.empty('🕘', 'No staff');
+
+        // History is a per-staff monthly count — days signed in out of the
+        // working days elapsed (weekends excluded) — not a flat list of every
+        // entry. "View" drills into one person's day-by-day log for the period.
+        var histTable = Perf.paginatedTable({
+          pageSize: 50,
+          rows: rows,
+          cols: [
+            { label: 'Staff', render: function (a) {
+              return '<div><div class="li-title">' + esc(a.staffName) + '</div>' +
+                '<div class="li-sub">' + esc(a.department || '') + '</div></div>';
+            } },
+            { label: 'Signed in', render: function (a) {
+              return '<div style="min-width:130px"><div class="li-title">' + a.present + ' / ' + a.workingDays +
+                ' <span class="muted small">days</span></div>' + UI.progress(a.attendanceRate) + '</div>';
+            } },
+            { label: 'On time', align: 'right', render: function (a) { return a.onTime; } },
+            { label: 'Late', align: 'right', render: function (a) { return a.late; } },
+            { label: 'Absent', align: 'right', render: function (a) { return a.absent; } },
+            { label: 'Leave', align: 'right', render: function (a) { return a.leave; } },
+            { label: 'Rate', align: 'right', render: function (a) { return UI.pct(a.attendanceRate); } },
+            { label: '', align: 'right', render: function (a) { return actBtn('View', 'log', a.staffId); } }
+          ],
+          searchFields: ['staffName', 'department'],
+          empty: 'No active staff'
+        });
+
+        var histContainer = '<div id="attHistTable">' + histTable + '</div>';
+        mount.innerHTML = UI.grid('g-1-2',
+          UI.card({ title: 'Today', sub: board.date, actions: actBtn('+ Leave / Holiday', 'setnew'),
+            body: '<div class="wrap" style="margin-bottom:10px">' +
+              UI.pill('On time ' + board.onTime, 'green') + ' ' + UI.pill('Late ' + board.late, 'amber') + ' ' +
+              UI.pill('Absent ' + board.absent, 'red') + ' ' + UI.pill('Not signed ' + board.notSigned, 'grey') + '</div>' + boardRows }) +
+          UI.card({ title: 'History', sub: App.periodLabel(App.period()) + ' · out of ' + summary.workingDays + ' working days',
+            body: histContainer }));
+        Perf.wirePaginatedTable(mount.querySelector('#attHistTable'));
+
+        bind(mount, {
+          set: function (id) { var r = board.rows.find(function (x) { return x.staffId === id; }); openAttendanceSet(id, r ? r.name : ''); },
+          setnew: function () { openAttendanceSet(null, ''); },
+          log: function (id) { var r = rows.find(function (x) { return x.staffId === id; }); openAttendanceLog(id, r ? r.staffName : ''); }
+        });
+      });
+    }
+  };
+
+  /* ---------- Discipline ---------- */
+  views.discipline = {
+    title: 'Discipline', sub: 'Strikes, clearances and suspensions — history is permanent',
+    render: function (mount) {
+      return Promise.all([App.api('api_staffList'), App.api('api_strikeList')]).then(function (res) {
+        var staff = res[0], strikes = res[1];
+        var flagged = staff.filter(function (s) { return s.flagged || s.suspended; });
+        App.setBadge('discipline', flagged.length);
+
+        var flaggedBody = flagged.length ? flagged.map(function (s) {
+          return '<div class="list-item">' + UI.avatar(s, 'sm') +
+            '<div style="flex:1;min-width:0"><div class="li-title">' + esc(s.name) + ' ' + UI.staffPill(s.status) + '</div>' +
+            '<div class="li-sub">' + s.strikeCount + ' active strike(s) · ' + s.totalStrikesIssued + ' lifetime · ' + s.suspensionCount + ' suspension(s)</div>' +
+            (s.clearedAt ? '<div class="li-sub">Last cleared ' + esc(s.clearedAt) + ' by ' + esc(s.clearedBy || 'admin') +
+              (s.clearanceNote ? ' — ' + esc(s.clearanceNote) : '') + '</div>' : '') + '</div>' +
+            '<div class="row-gap">' + actBtn('Clear record', 'clear', s.staffId, 'btn-brand') +
+            (!s.suspended ? actBtn('Suspend', 'suspend', s.staffId, 'btn-ghost') : '') + '</div></div>';
+        }).join('') : UI.empty('✅', 'No active discipline cases', 'Nobody is flagged or suspended right now');
+
+        var strikeTable = Perf.paginatedTable({
+          pageSize: 50,
+          rows: strikes,
+          cols: [
+            { label: 'Date', render: function (s) { return esc(s.date); } },
+            { label: 'Staff', render: function (s) { return esc(s.staffName); } },
+            { label: 'Category', render: function (s) { return esc(s.category); } },
+            { label: 'Reason', render: function (s) { return esc(s.reason); } },
+            { label: '#', render: function (s) { return s.strikeNumber; } },
+            { label: 'Penalty', align: 'right', render: function (s) { return money(s.penaltyAmount); } },
+            { label: 'Status', render: function (s) { return UI.pill(s.status, s.status === 'Active' ? 'red' : 'grey'); } }
+          ],
+          searchFields: ['staffName', 'category', 'reason', 'status'],
+          empty: 'No strikes on record'
+        });
+
+        var strikeContainer = '<div id="strikeHistTable">' + strikeTable + '</div>';
+        mount.innerHTML = '<div class="spread" style="margin-bottom:14px"><div class="wrap">' +
+          UI.pill(flagged.length + ' flagged/suspended', flagged.length ? 'amber' : 'grey') +
+          '</div><button class="btn btn-warn" data-act="issue">Issue strike</button></div>' +
+          UI.card({ title: 'Flagged & suspended', sub: 'Reinstating keeps the permanent record', body: flaggedBody }) +
+          spacer() + UI.card({ title: 'Strike history', sub: strikes.length + ' record(s)', body: strikeContainer });
+        Perf.wirePaginatedTable(mount.querySelector('#strikeHistTable'));
+
+        bind(mount, {
+          issue: function () { openIssueStrike(); },
+          clear: function (id) { var s = flagged.find(function (x) { return x.staffId === id; }); clearRecord(id, s ? s.name : 'staff'); },
+          suspend: function (id) { var s = flagged.find(function (x) { return x.staffId === id; }); suspendStaff(id, s ? s.name : 'staff'); }
+        });
+      });
+    }
+  };
+
+  /* ---------- Payroll ---------- */
+  views.payroll = {
+    title: 'Payroll',
+    sub: function () { return 'Progress-based pay · ' + App.periodLabel(App.period()); },
+    render: function (mount) {
+      return App.api('api_payrollPreview', { periodType: App.period() }).then(function (d) {
+        var sum = d.summary, persisted = d.persisted || [];
+        var usePersisted = persisted.length > 0;
+        var rows = usePersisted ? persisted : d.rows;
+        _pay = {}; persisted.forEach(function (p) { _pay[p.payrollId] = p; });
+
+        var kpis = UI.grid('g-4', [
+          UI.kpi({ label: 'Guaranteed salary bill', value: money(sum.guaranteed), icon: '🎯',
+                   foot: sum.autoAllocated ? 'Shared across tasks (' + esc(sum.allocationMode || 'Equal') + ')' : 'Manual per-task amounts' }),
+          UI.kpi({ label: 'Progress earned', value: money(sum.earned), icon: '📈',
+                   foot: UI.pct(sum.guaranteeRate) + ' of the guarantee released' }),
+          UI.kpi({ label: 'Forfeited', value: money(sum.forfeited), icon: '📉',
+                   foot: money(sum.pendingValidationValue) + ' still held for validation' }),
+          UI.kpi({ label: 'Net payable', value: money(sum.net), icon: '💰', dark: true, foot: sum.periodLabel })
+        ].join(''));
+
+        var table = Perf.paginatedTable({
+          pageSize: 50,
+          rows: rows,
+          cols: [
+            { label: 'Staff', render: function (r) { return '<div class="li-title">' + esc(r.staffName) + '</div>'; } },
+            { label: 'Tasks', render: function (r) { return r.tasksConsidered; } },
+            { label: 'Guaranteed', align: 'right', render: function (r) {
+              // The promised monthly salary for this period — the basis of every share.
+              return r.guaranteed ? money(r.guaranteed) : '<span class="muted">—</span>';
+            } },
+            { label: 'Allocated', align: 'right', render: function (r) { return money(r.grossAllocated); } },
+            { label: 'Earned', align: 'right', render: function (r) { return money(r.progressEarned); } },
+            { label: 'Forfeited', align: 'right', render: function (r) {
+              return r.forfeited ? '<span class="muted">' + money(r.forfeited) + '</span>' : '—';
+            } },
+            { label: 'Penalties', align: 'right', render: function (r) { return money(r.penalties); } },
+            { label: 'Adjust', align: 'right', render: function (r) { return money(r.adjustments); } },
+            { label: 'Net', align: 'right', render: function (r) { return '<b>' + money(r.netPay) + '</b>'; } },
+            { label: 'Status', render: function (r) { return UI.payPill(r.status); } },
+            { label: '', align: 'right', render: function (r) {
+              if (!usePersisted) return '<span class="li-sub">Draft</span>';
+              var a = '';
+              if (r.status !== 'Paid') a += actBtn('Adjust', 'adjust', r.payrollId);
+              if (r.status === 'Draft') a += ' ' + actBtn('Approve', 'approve', r.payrollId, 'btn-brand');
+              if (r.status === 'Approved') a += ' ' + actBtn('Mark paid', 'paid', r.payrollId, 'btn-brand');
+              return a || '—';
+            } }
+          ],
+          searchFields: ['staffName'],
+          empty: 'No active staff to pay'
+        });
+
+        var tableContainer = '<div class="card" id="payrollTable">' + table + '</div>';
+        mount.innerHTML = kpis + spacer() +
+          '<div class="spread" style="margin-bottom:14px"><div class="wrap">' +
+          (usePersisted ? UI.pill('Locked rows: ' + persisted.length, 'blue') : UI.pill('Draft preview — not yet saved', 'grey')) +
+          (sum.autoAllocated
+            ? UI.pill('Allocations derived from guaranteed salaries · ' + (sum.allocationMode || 'Equal') + ' split', 'green')
+            : UI.pill('Manual per-task amounts', 'grey')) +
+          '</div><div class="row-gap">' +
+          (sum.autoAllocated ? '<button class="btn" data-act="recalc">Recalculate allocations</button>' : '') +
+          '<button class="btn" data-act="export">Export CSV</button>' +
+          '<button class="btn btn-brand" data-act="run">' + (usePersisted ? 'Refresh payroll' : 'Run payroll') + '</button></div></div>' +
+          tableContainer;
+        Perf.wirePaginatedTable(mount.querySelector('#payrollTable'));
+
+        bind(mount, {
+          run: function () { runPayroll(); },
+          recalc: function () { recalcAllocations(); },
+          export: function () { exportReport('csv'); },
+          adjust: function (id) { openAdjust(_pay[id]); },
+          approve: function (id) { approveRow(id); },
+          paid: function (id) { openMarkPaid(_pay[id]); }
+        });
+      });
+    }
+  };
+
+  /**
+   * Repair pass: back-fill validated progress from daily reports that were
+   * already approved before the "approval releases pay" fix existed. Only ever
+   * raises a task's validated %, so it is safe to run repeatedly.
+   */
+  function syncApprovedReports() {
+    App.confirm({
+      title: 'Sync approved reports',
+      message: 'Re-check every task against its approved daily reports and raise its ' +
+               'validated % (and earnings) to match the highest approved report. ' +
+               'This never lowers a value and never touches approved or paid payroll.',
+      confirmLabel: 'Sync now'
+    }).then(function (ok) {
+      if (!ok) return;
+      App.busy(true);
+      App.api('api_taskSyncValidated', {})
+        .then(function (r) {
+          App.busy(false);
+          r = r || {};
+          if (r.updated) {
+            App.toast('Synced — ' + r.updated + ' task(s) updated from ' + r.scanned + ' checked. ' +
+              'Re-run payroll to see the new earnings.', 'good');
+          } else {
+            App.toast('Nothing to update — all ' + (r.scanned || 0) + ' task(s) already match their approved reports.', 'good');
+          }
+          App.refresh();
+        })
+        .catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+    });
+  }
+
+  /* ---------- Allocation (guaranteed salary → per-task shares) ---------- */
+
+  /**
+   * Re-split every active member's guarantee across the tasks due in each of
+   * their months. Safe to run at any time: months whose payroll is already
+   * approved or paid are left frozen.
+   */
+  function recalcAllocations(staffId, name) {
+    App.confirm({
+      title: 'Recalculate allocations',
+      message: 'Share ' + (name ? name + '’s' : 'every active member’s') +
+               ' guaranteed monthly salary across the tasks due in each month again. ' +
+               'Months already approved or paid stay frozen.',
+      confirmLabel: 'Recalculate'
+    }).then(function (ok) {
+      if (!ok) return;
+      App.busy(true);
+      App.api('api_allocationRecalc', staffId ? { staffId: staffId } : {})
+        .then(function (r) {
+          App.busy(false);
+          if (r && r.skipped) { App.toast(r.skipped, 'bad'); return; }
+          App.toast('Allocations recalculated — ' + (r.written || 0) + ' task amount(s) updated across ' +
+            (r.months || 0) + ' month(s).', 'good');
+          App.refresh();
+        })
+        .catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+    });
+  }
+
+  views.allocation = {
+    title: 'Task allocation',
+    sub: function () { return 'Guaranteed salary shared across tasks · monthly'; },
+    render: function (mount) {
+      return App.api('api_allocationBoard', { refDate: '' }).then(function (d) {
+        var t = d.totals || {}, rows = d.rows || [];
+
+        var kpis = UI.grid('g-4', [
+          UI.kpi({ label: 'Guaranteed this month', value: money(t.guaranteed), icon: '🎯',
+                   foot: t.staff + ' staff · ' + t.tasks + ' task(s) due' }),
+          UI.kpi({ label: 'Allocated to tasks', value: money(t.allocated), icon: '🧮',
+                   foot: t.enabled ? esc(t.mode || 'Equal') + ' split' : 'Manual amounts' }),
+          UI.kpi({ label: 'Earned so far', value: money(t.earned), icon: '📈',
+                   foot: UI.pct(t.payoutRate) + ' of what is allocated' }),
+          UI.kpi({ label: 'Forfeited', value: money(t.forfeited), icon: '📉', dark: true,
+                   foot: t.monthLabel })
+        ].join(''));
+
+        var note = '<div class="card" style="margin-bottom:14px"><div class="small">' +
+          '<b>How this is worked out.</b> Each person’s guaranteed monthly salary is divided among the tasks ' +
+          'due in that month — one task carries the whole salary, four tasks carry a quarter each' +
+          (t.mode === 'Weighted' ? ', weighted by priority' : '') +
+          '. Every task then pays out on its validated completion percentage, so the share is the ceiling and the ' +
+          'percentage decides what is actually earned.' +
+          (t.enabled ? '' : ' <b>Automatic allocation is currently switched off</b> (Config → AutoAllocateFromSalary), so amounts are typed in per task.') +
+          '</div></div>';
+
+        var table = Perf.paginatedTable({
+          pageSize: 50,
+          rows: rows,
+          cols: [
+            { label: 'Staff', render: function (r) {
+              return '<div><div class="li-title">' + esc(r.staffName) +
+                (r.locked ? ' ' + UI.pill('frozen', 'grey') : '') +
+                (r.drift ? ' ' + UI.pill('needs recalc', 'amber') : '') +
+                '</div><div class="li-sub">' + esc(r.department || '—') + '</div></div>';
+            } },
+            { label: 'Guaranteed', align: 'right', render: function (r) {
+              return r.guaranteed ? '<b>' + money(r.guaranteed) + '</b>' : '<span class="muted">not set</span>';
+            } },
+            { label: 'Tasks', align: 'right', render: function (r) { return r.taskCount; } },
+            { label: 'Share / task', align: 'right', render: function (r) {
+              return r.taskCount ? money(r.sharePerTask) : '<span class="muted">—</span>';
+            } },
+            { label: 'Allocated', align: 'right', render: function (r) { return money(r.allocated); } },
+            { label: 'Earned', align: 'right', render: function (r) { return '<b>' + money(r.earned) + '</b>'; } },
+            { label: 'Forfeited', align: 'right', render: function (r) {
+              return r.forfeited ? '<span class="muted">' + money(r.forfeited) + '</span>' : '—';
+            } },
+            { label: 'Released', render: function (r) {
+              return '<div style="min-width:100px">' + UI.progress(r.payoutRate) + '</div>';
+            } },
+            { label: '', align: 'right', render: function (r) {
+              return actBtn('Breakdown', 'lines', r.staffId) + ' ' + actBtn('Recalc', 'one', r.staffId);
+            } }
+          ],
+          searchFields: ['staffName', 'department'],
+          empty: 'No active staff'
+        });
+
+        mount.innerHTML = kpis + spacer() + note +
+          '<div class="spread" style="margin-bottom:14px"><div class="wrap">' +
+          UI.pill(t.monthLabel || '', 'blue') +
+          UI.pill(t.enabled ? 'Automatic' : 'Manual', t.enabled ? 'green' : 'grey') +
+          '</div><div class="row-gap">' +
+          '<button class="btn btn-brand" data-act="recalcAll">Recalculate all</button>' +
+          '</div></div>' +
+          '<div class="card" id="allocTable">' + table + '</div>';
+        Perf.wirePaginatedTable(mount.querySelector('#allocTable'));
+
+        bind(mount, {
+          recalcAll: function () { recalcAllocations(); },
+          one: function (id) {
+            var r = rows.find(function (x) { return x.staffId === id; });
+            recalcAllocations(id, r ? r.staffName : '');
+          },
+          lines: function (id) {
+            var r = rows.find(function (x) { return x.staffId === id; });
+            if (r) openAllocationLines(r, t.monthLabel);
+          }
+        });
+      });
+    }
+  };
+
+  /* Per-task breakdown of one person's month. */
+  function openAllocationLines(r, monthLabel) {
+    var lines = r.lines || [];
+    var body = '<div class="small" style="margin-bottom:10px">' +
+      money(r.guaranteed) + ' guaranteed for ' + esc(monthLabel || '') + ' shared across ' +
+      lines.length + ' task' + (lines.length === 1 ? '' : 's') +
+      (r.locked ? ' · <b>this month is frozen</b> (payroll approved or paid)' : '') +
+      '</div>' +
+      (lines.length ? UI.table({
+        rows: lines,
+        cols: [
+          { label: 'Task', render: function (l) {
+            return '<div><div class="li-title">' + esc(l.title) + '</div><div class="li-sub">' +
+              esc(l.taskType) + ' · due ' + esc(l.dueDate) + '</div></div>';
+          } },
+          { label: 'Status', render: function (l) { return UI.taskPill(l.status); } },
+          { label: 'Share', align: 'right', render: function (l) {
+            return money(l.share) +
+              (l.stored !== l.share ? '<div class="li-sub">sheet says ' + money(l.stored) + '</div>' : '');
+          } },
+          { label: 'Progress', render: function (l) {
+            return '<div style="min-width:90px">' + UI.progress(l.effectiveProgress) + '</div>';
+          } },
+          { label: 'Earns', align: 'right', render: function (l) { return '<b>' + money(l.payable) + '</b>'; } }
+        ]
+      }) : UI.empty('🗓️', 'No tasks due in ' + (monthLabel || 'this month'),
+             'The whole guarantee is unallocated until a task is due that month.')) +
+      '<div class="li-sub" style="margin-top:10px">Allocated ' + money(r.allocated) +
+      ' · earned ' + money(r.earned) + ' · forfeited ' + money(r.forfeited) + '</div>';
+
+    App.modal({
+      title: r.staffName + ' — allocation breakdown',
+      wide: true,
+      body: body,
+      actions: [{ label: 'Close', close: true }]
+    });
+  }
+
+  /* ---------- Reports ---------- */
+  function renderOrgReport(r) {
+    var t = r.totals || {};
+    var kpis = UI.grid('g-4', [
+      UI.kpi({ label: 'Staff', value: t.staffCount, icon: '👥' }),
+      UI.kpi({ label: 'Tasks completed', value: t.tasksCompleted, icon: '✅', foot: UI.pct(t.completionRate) + ' completion' }),
+      UI.kpi({ label: 'Attendance', value: UI.pct(t.attendanceRate), icon: '🕘' }),
+      UI.kpi({ label: 'Net payable', value: money(t.netPayable), icon: '💰', dark: true, foot: r.periodLabel })
+    ].join(''));
+    var table = UI.table({
+      cols: [
+        { label: 'Staff', render: function (s) {
+          return '<div><div class="li-title">' + esc(s.staffName) + '</div><div class="li-sub">' + esc(s.department || s.role) + '</div></div>';
+        } },
+        { label: 'Completion', render: function (s) {
+          var tk = s.tasks || {};
+          return '<div style="min-width:110px">' + UI.progress(tk.completionRate) + '<div class="li-sub">' + (tk.completed || 0) + '/' + (tk.assigned || 0) + '</div></div>';
+        } },
+        { label: 'Attendance', render: function (s) { return UI.pct((s.attendance || {}).attendanceRate); } },
+        { label: 'Reports', render: function (s) { return UI.pct((s.dailyReporting || {}).onTimeRate); } },
+        { label: 'Strikes', render: function (s) {
+          var di = s.discipline || {};
+          return (di.strikesIssued || 0) + (di.suspensions ? ' · ' + di.suspensions + ' susp' : '');
+        } },
+        { label: 'Net pay', align: 'right', render: function (s) { return money((s.pay || {}).netPayable); } },
+        { label: 'Grade', render: function (s) { return UI.pill((s.appraisal || {}).grade || '—', 'brand'); } }
+      ],
+      rows: r.staff || [], empty: 'No staff in this period', searchFields: ['staffName', 'department']
+    });
+    return kpis + spacer() + UI.card({
+      title: (r.company ? r.company + ' — ' : '') + r.periodLabel,
+      sub: esc(r.periodStart) + ' → ' + esc(r.periodEnd) + ' · generated ' + esc(r.generatedAt),
+      body: table
+    });
+  }
+
+  function renderStaffReport(r) {
+    var tk = r.tasks || { detail: [] }, at = r.attendance || {}, di = r.discipline || { detail: [] },
+        py = r.pay || {}, ap = r.appraisal || {};
+    var kpis = UI.grid('g-4', [
+      UI.kpi({ label: 'Completion', value: UI.pct(tk.completionRate), icon: '✅', foot: (tk.completed || 0) + '/' + (tk.assigned || 0) + ' tasks' }),
+      UI.kpi({ label: 'Attendance', value: UI.pct(at.attendanceRate), icon: '🕘', foot: (at.present || 0) + '/' + (at.workingDays || 0) + ' days' }),
+      UI.kpi({ label: 'Net pay', value: money(py.netPayable), icon: '💰',
+               foot: py.guaranteed ? UI.pct(py.payoutRate) + ' of ' + money(py.guaranteed) + ' guaranteed' : UI.pct(py.payoutRate) + ' of gross' }),
+      UI.kpi({ label: 'Grade', value: ap.grade || '—', icon: '⭐', dark: true, foot: 'Score ' + (ap.score != null ? ap.score : '—') })
+    ].join(''));
+
+    var taskTable = UI.table({
+      cols: [
+        { label: 'Task', render: function (x) { return '<div><div class="li-title">' + esc(x.title) + '</div><div class="li-sub">' + esc(x.taskType) + ' · ' + esc(x.priority) + '</div></div>'; } },
+        { label: 'Status', render: function (x) { return UI.taskPill(x.status); } },
+        { label: 'Due', render: function (x) { return esc(x.dueDate || '—'); } },
+        { label: 'Progress', render: function (x) {
+          return UI.pct(x.validatedProgress) + (x.reportedProgress != x.validatedProgress ? ' <span class="li-sub">(rep ' + UI.pct(x.reportedProgress) + ')</span>' : '');
+        } },
+        { label: 'Allocated', align: 'right', render: function (x) { return money(x.amountAllocated); } },
+        { label: 'Payable', align: 'right', render: function (x) { return money(x.payable); } },
+        { label: 'Rollovers', render: function (x) { return x.rolloverCount || 0; } }
+      ],
+      rows: tk.detail || [], empty: 'No tasks in this period', searchFields: ['title']
+    });
+
+    var discBody = (di.detail || []).length ? UI.table({
+      cols: [
+        { label: 'Date', render: function (s) { return esc(s.date); } },
+        { label: 'Category', render: function (s) { return esc(s.category); } },
+        { label: 'Reason', render: function (s) { return esc(s.reason); } },
+        { label: '#', render: function (s) { return s.strikeNumber; } },
+        { label: 'Penalty', align: 'right', render: function (s) { return money(s.penaltyAmount); } },
+        { label: 'Status', render: function (s) { return UI.pill(s.status, s.status === 'Active' ? 'red' : 'grey'); } }
+      ],
+      rows: di.detail
+    }) : '<div class="muted small">No strikes in this period. Lifetime: ' + (r.lifetimeStrikes || 0) + ' strike(s), ' + (r.lifetimeSuspensions || 0) + ' suspension(s).</div>';
+
+    var appraisal = '<div class="grid g-2">' +
+      '<div><div class="card-sub">Strengths</div>' +
+      ((ap.strengths || []).map(function (x) { return '<div class="li-title">✅ ' + esc(x) + '</div>'; }).join('') || '<div class="muted small">—</div>') + '</div>' +
+      '<div><div class="card-sub">Areas to improve</div>' +
+      ((ap.weaknesses || []).map(function (x) { return '<div class="li-title">⚠️ ' + esc(x) + '</div>'; }).join('') || '<div class="muted small">—</div>') + '</div>' +
+      '</div><div class="notice brand mt"><div><div class="n-title">Remark</div><div class="n-body">' + esc(ap.remark || '') + '</div></div></div>';
+
+    var payGrid = UI.grid('g-4', [
+      UI.kpi({ label: 'Guaranteed salary', value: money(py.guaranteed) }),
+      UI.kpi({ label: 'Allocated to tasks', value: money(py.grossAllocated) }),
+      UI.kpi({ label: 'Progress earned', value: money(py.progressEarned) }),
+      UI.kpi({ label: 'Forfeited', value: money(py.forfeited) }),
+      UI.kpi({ label: 'Penalties', value: money(py.penalties) }),
+      UI.kpi({ label: 'Adjustments', value: money(py.adjustments) }),
+      UI.kpi({ label: 'Held (unvalidated)', value: money(py.heldPendingValidation) }),
+      UI.kpi({ label: 'Net payable', value: money(py.netPayable), dark: true })
+    ].join('')) +
+      (py.allocationBasis ? '<div class="li-sub mt">Allocation basis: ' + esc(py.allocationBasis) + '</div>' : '');
+
+    return '<div class="card"><div class="spread"><div><div class="card-title">' + esc(r.staffName) + '</div>' +
+      '<div class="card-sub">' + esc(r.role) + (r.department ? ' · ' + esc(r.department) : '') + ' · ' + esc(r.periodLabel) + '</div></div>' +
+      UI.staffPill(r.accountStatus) + '</div></div>' +
+      spacer() + kpis +
+      spacer() + UI.card({ title: 'Tasks & allocation', body: taskTable }) +
+      spacer() + UI.card({ title: 'Pay breakdown', sub: py.payBasis || 'Admin-validated progress', body: payGrid }) +
+      spacer() + UI.card({ title: 'Discipline', sub: (di.strikesIssued || 0) + ' this period · ' + (r.lifetimeStrikes || 0) + ' lifetime', body: discBody }) +
+      spacer() + UI.card({ title: 'Appraisal', body: appraisal });
+  }
+
+  views.reports = {
+    title: 'Reports',
+    sub: function () { return App.periodLabel(App.period()) + ' · organisation & individual'; },
+    render: function (mount) {
+      return App.api('api_staffList').then(function (staff) {
+        mount.innerHTML = '<div class="spread" style="margin-bottom:14px"><div class="row-gap">' +
+          '<select class="period-select" id="repScope"><option value="">Organisation (all staff)</option>' +
+          staff.map(function (s) { return '<option value="' + esc(s.staffId) + '">' + esc(s.name) + '</option>'; }).join('') +
+          '</select></div><div class="row-gap">' +
+          '<button class="btn" data-act="csv">Export CSV</button>' +
+          '<button class="btn" data-act="pdf">Export PDF</button>' +
+          '<button class="btn btn-brand" data-act="gen">Generate &amp; save</button></div></div>' +
+          '<div id="repOut"><div class="empty"><div class="spinner"></div></div></div>';
+        var scope = '';
+        function load() {
+          var out = mount.querySelector('#repOut');
+          out.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+          App.api('api_reportBuild', { periodType: App.period(), staffId: scope }).then(function (res) {
+            out.innerHTML = res.scope === 'staff' ? renderStaffReport(res.report) : renderOrgReport(res.report);
+          }).catch(function (e) { out.innerHTML = UI.empty('⚠', 'Could not build report', e.message); });
+        }
+        mount.querySelector('#repScope').addEventListener('change', function () { scope = this.value; load(); });
+        load();
+        bind(mount, {
+          csv: function () { exportReport('csv', scope); },
+          pdf: function () { exportReport('pdf', scope); },
+          gen: function () {
+            App.busy(true);
+            App.api('api_reportGenerate', { periodType: App.period() }).then(function (r) {
+              App.busy(false); App.toast('Saved ' + r.persisted + ' report(s) for ' + r.periodLabel + '.', 'good');
+            }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+          }
+        });
+      });
+    }
+  };
+
+  /* ---------- Documents ----------
+     Requirement 6 — general documents can go to everyone OR to hand-picked
+     staff (Visibility = Individual), and every task can carry its own files.
+     Each card says who can see it. */
+  views.documents = {
+    title: 'Documents', sub: 'Everything uploaded to Google Drive — and who can see it',
+    render: function (mount) {
+      return App.api('api_uploadList', {}).then(function (files) {
+        function who(u) {
+          if (u.visibility === 'Individual') {
+            var names = (u.audienceNames || []);
+            return UI.pill('Sent to ' + (names.length ? names.join(', ') : 'selected staff'), 'blue');
+          }
+          if (u.visibility === 'All') return UI.pill('Everyone', 'green');
+          if (u.visibility === 'Staff') return UI.pill('All staff', 'green');
+          return UI.pill('Private · uploader + admins', 'grey');
+        }
+        var cards = files.length ? files.map(function (u) {
+          return '<div class="card tight" data-search="' + esc(u.fileName + ' ' + u.category + ' ' + u.staffName + ' ' + (u.audienceNames || []).join(' ')) + '">' +
+            '<div class="row-gap" style="align-items:flex-start"><span class="file-ico">📄</span>' +
+            '<div style="flex:1;min-width:0"><div class="li-title" style="word-break:break-word">' + esc(u.fileName) + '</div>' +
+            '<div class="li-sub">' + esc(u.category) + ' · ' + u.sizeKb + ' KB</div>' +
+            '<div class="li-sub">' + esc(u.staffName) + ' · ' + esc(u.uploadedAt) + '</div>' +
+            '<div class="wrap" style="margin-top:6px">' + who(u) +
+              (u.taskId ? ' ' + UI.pill('Task ' + u.taskId, 'outline') : '') + '</div>' +
+            (u.description ? '<div class="small" style="margin-top:4px">' + esc(u.description) + '</div>' : '') + '</div></div>' +
+            '<div class="row-gap mt"><a class="btn xs" href="' + esc(u.url) + '" target="_blank" rel="noopener">Open</a>' +
+            actBtn('Delete', 'del', u.uploadId, 'btn-ghost') + '</div></div>';
+        }).join('') : UI.empty('📁', 'No documents yet', 'Use “Upload document” to add one');
+
+        mount.innerHTML = '<div class="spread" style="margin-bottom:14px"><div class="wrap">' +
+          UI.pill(files.length + ' files', 'grey') +
+          '</div><div class="row-gap">' +
+          '<button class="btn" data-act="up">Upload document</button>' +
+          '<button class="btn btn-brand" data-act="send">Send to individual staff</button></div></div>' +
+          '<p class="muted small" style="margin:-6px 0 14px">“Send to individual staff” shares the file with the ' +
+          'people you pick, drops it in their own Drive folder and notifies them — use it for payslips, contracts ' +
+          'or warning letters. Task attachments are added from the task itself.</p>' +
+          (files.length ? UI.grid('g-3', cards) : '<div class="card">' + cards + '</div>');
+
+        bind(mount, {
+          up: function () { App.openUpload(); },
+          send: function () { App.openUpload({ visibility: 'Individual', category: 'General' }); },
+          del: function (id) {
+            App.confirm({ title: 'Delete document', message: 'Move this file to Drive trash and remove it from the list?', confirmLabel: 'Delete', tone: 'danger' })
+              .then(function (ok) {
+                if (!ok) return;
+                App.api('api_uploadDelete', { uploadId: id })
+                  .then(function () { App.toast('Deleted.', 'good'); App.refresh(); })
+                  .catch(function (e) { App.toast(e.message, 'bad'); });
+              });
+          }
+        });
+      });
+    }
+  };
+
+  /* ---------- Settings ---------- */
+  views.settings = {
+    title: 'Settings', sub: 'Configuration, automation and logs',
+    render: function (mount) {
+      return App.api('api_configList').then(function (d) {
+        var groups = {};
+        (d.rows || []).forEach(function (r) { var c = r.category || 'General'; (groups[c] = groups[c] || []).push(r); });
+        function isBool(v) { return /^(true|false)$/i.test(String(v).trim()); }
+        var cfgHtml = Object.keys(groups).sort().map(function (cat) {
+          var fields = groups[cat].map(function (r) {
+            var inp = isBool(r.value)
+              ? '<select data-cfg="' + esc(r.key) + '">' + opt([{ value: 'TRUE', label: 'On' }, { value: 'FALSE', label: 'Off' }], String(r.value).toUpperCase()) + '</select>'
+              : '<input type="text" data-cfg="' + esc(r.key) + '" value="' + esc(r.value) + '">';
+            return field(r.key, inp, r.description);
+          }).join('');
+          return UI.card({ title: cat, body: fields, className: 'tight' });
+        }).join('<div style="height:12px"></div>');
+
+        var autos = [
+          ['runDailyAutomationNow', 'Run daily chain now'],
+          ['activateScheduledTasks', 'Activate scheduled tasks'],
+          ['checkDailyReports', 'Strike missing daily reports'],
+          ['sweepAttendance', 'Sweep absentees'],
+          ['processDailyRollover', 'Roll over incomplete daily tasks'],
+          ['generateWeeklyReports', 'Generate weekly reports'],
+          ['generateMonthlyReports', 'Generate monthly reports + payroll'],
+          ['generateQuarterlyReports', 'Generate quarterly reports'],
+          ['generateHalfYearlyReports', 'Generate half-yearly reports'],
+          ['generateYearlyReports', 'Generate yearly reports']
+        ];
+        var autoBody = '<div class="wrap">' + autos.map(function (a) {
+          return '<button class="btn sm" data-act="auto" data-id="' + a[0] + '">' + esc(a[1]) + '</button>';
+        }).join('') + '</div>';
+
+        var info = '<div class="li-sub">Timezone</div><div class="li-title" style="margin-bottom:8px">' + esc(d.timezone || '—') + '</div>' +
+          '<div class="li-sub">Spreadsheet ID</div><div class="mono small" style="margin-bottom:8px;word-break:break-all">' + esc(d.spreadsheetId || '—') + '</div>' +
+          '<div class="li-sub">Web app URL</div><div class="small" style="word-break:break-all">' +
+          (d.webAppUrl ? '<a href="' + esc(d.webAppUrl) + '" target="_blank" rel="noopener">' + esc(d.webAppUrl) + '</a>' : '—') + '</div>';
+
+        mount.innerHTML = '<div class="spread" style="margin-bottom:14px"><div class="wrap">' +
+          UI.pill((d.rows || []).length + ' settings', 'grey') +
+          '</div><button class="btn btn-brand" data-act="savecfg">Save settings</button></div>' +
+          UI.grid('g-2-1', '<div>' + cfgHtml + '</div>' + UI.card({ title: 'Workspace', body: info })) +
+          spacer() +
+          UI.card({ title: 'Automation', sub: 'Run a job now (they also run on schedule)', actions: actBtn('Install/repair triggers', 'install'), body: autoBody }) +
+          spacer() +
+          UI.card({ title: 'System logs', sub: 'Most recent first', actions: actBtn('Refresh logs', 'logs'),
+            body: '<div id="logBox"><div class="muted small">Tap “Refresh logs” to load.</div></div>' });
+
+        bind(mount, {
+          savecfg: function () {
+            var updates = {};
+            mount.querySelectorAll('[data-cfg]').forEach(function (n) {
+              var key = n.getAttribute('data-cfg');
+              var orig = (d.rows.find(function (r) { return r.key === key; }) || {}).value;
+              if (String(n.value) !== String(orig)) updates[key] = n.value;
+            });
+            if (!Object.keys(updates).length) { App.toast('No changes to save.', 'warn'); return; }
+            App.api('api_configSave', { updates: updates })
+              .then(function (r) { App.toast('Saved ' + (r.applied != null ? r.applied : Object.keys(updates).length) + ' setting(s).', 'good'); App.refresh(); })
+              .catch(function (e) { App.toast(e.message, 'bad'); });
+          },
+          install: function () {
+            App.confirm({ title: 'Install triggers', message: 'Install / repair all time-driven automation triggers? This replaces existing copies.', confirmLabel: 'Install' })
+              .then(function (ok) {
+                if (!ok) return;
+                App.busy(true);
+                App.api('api_installTriggers').then(function (r) {
+                  App.busy(false); App.toast('Installed ' + (r.installed != null ? r.installed : '') + ' trigger(s).', 'good'); App.refresh();
+                }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+              });
+          },
+          auto: function (id) {
+            App.busy(true);
+            App.api('api_runAutomation', { name: id }).then(function () { App.busy(false); App.toast('Ran ' + id + '.', 'good'); })
+              .catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+          },
+          logs: function () {
+            var box = mount.querySelector('#logBox');
+            box.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+            App.api('api_logs', { limit: 100 }).then(function (rows) {
+              box.innerHTML = rows.length ? UI.table({
+                cols: [
+                  { label: 'Time', render: function (l) { return esc(l.timestamp); } },
+                  { label: 'Level', render: function (l) { return UI.pill(l.level, l.level === 'ERROR' ? 'red' : (l.level === 'WARN' ? 'amber' : 'grey')); } },
+                  { label: 'Source', render: function (l) { return esc(l.source); } },
+                  { label: 'Message', render: function (l) { return esc(l.message); } }
+                ],
+                rows: rows
+              }) : UI.empty('📜', 'No logs');
+            }).catch(function (e) { box.innerHTML = UI.empty('⚠', e.message); });
+          }
+        });
+      });
+    }
+  };
+
+  /* ---------- Email (Requirement 10) ---------- */
+  views.email = {
+    title: 'Email', sub: 'Message staff and manage reusable templates',
+    render: function (mount) {
+      return App.api('api_emailData').then(function (d) {
+        var audience = d.audience || { staff: [], departments: [], roles: [], total: 0 };
+        var templates = d.templates || [];
+        var staff = audience.staff || [];
+
+        function recipientsFor(scope, val) {
+          if (scope === 'all') return staff;
+          if (scope === 'department') return staff.filter(function (s) { return s.department === val; });
+          if (scope === 'role') return staff.filter(function (s) { return s.role === val; });
+          if (scope === 'individual') {
+            var ids = Array.isArray(val) ? val : [];
+            return staff.filter(function (s) { return ids.indexOf(s.staffId) !== -1; });
+          }
+          return [];
+        }
+
+        var scopeOptions = [
+          { value: 'all', label: 'Everyone (' + staff.length + ')' },
+          { value: 'department', label: 'By department' },
+          { value: 'role', label: 'By role' },
+          { value: 'individual', label: 'Individual staff' }
+        ];
+
+        /* Requirement 4 — the sender line. Google only lets a script send as the
+           executing account or one of its verified aliases, so say plainly which
+           address will appear and what to do when the configured one cannot. */
+        var snd = d.sender || {};
+        var sendsAs = snd.from || snd.account || '';
+        var senderNote = '<div class="notice small" style="margin:0 0 12px"><div>' +
+          '<b>Sends as:</b> ' + esc(sendsAs || 'the account running this app') +
+          (snd.replyTo && snd.replyTo !== sendsAs ? ' · replies go to <b>' + esc(snd.replyTo) + '</b>' : '') +
+          (snd.aliasFallback
+            ? '<div class="small" style="margin-top:4px">' + esc(snd.configured) + ' is not a verified Gmail alias of ' +
+              esc(snd.account) + ', so it is used as the reply-to address instead. Verify it as an alias in Gmail, ' +
+              'or change <b>SenderEmail</b> in Settings.</div>'
+            : (snd.configured
+                ? ''
+                : '<div class="small" style="margin-top:4px">Set <b>SenderEmail</b> and <b>SenderName</b> in Settings ' +
+                  'to send from your company address.</div>')) +
+          '</div></div>';
+
+        var composeBody = senderNote +
+          field('Send to', '<select data-field="scope" id="emScope">' + opt(scopeOptions, 'all') + '</select>') +
+          '<div id="emValueWrap"></div>' +
+          '<div class="notice small" id="emCount" style="margin:0 0 12px"></div>' +
+          field('Subject', '<input type="text" id="emSubject" placeholder="e.g. Team meeting on Friday">') +
+          field('Message', '<textarea id="emBody" placeholder="Write your message here…" style="min-height:170px"></textarea>',
+            'Sent as a branded email to each recipient, greeted by name. Leave a blank line between paragraphs.') +
+          '<label class="check" style="margin-top:4px"><input type="checkbox" id="emSaveTpl"> ' +
+          '<span>Also save this message as a reusable template</span></label>' +
+          '<div id="emTplNameWrap" class="hidden" style="margin-top:10px">' +
+          field('Template name', '<input type="text" id="emTplName" placeholder="e.g. Monthly reminder">') + '</div>';
+
+        var tplBody = templates.length ? templates.map(function (t) {
+          return '<div class="list-item flat"><div style="flex:1;min-width:0">' +
+            '<div class="li-title">' + esc(t.name) + '</div>' +
+            '<div class="li-sub">' + esc(t.subject || '(no subject)') + '</div></div>' +
+            '<div class="row-gap">' + actBtn('Load', 'tpl-load', t.templateId, 'btn-brand') +
+            actBtn('Delete', 'tpl-del', t.templateId, 'btn-ghost') + '</div></div>';
+        }).join('') : UI.empty('✉️', 'No templates yet',
+          d.templatesReady
+            ? 'Compose a message and tick “save as a reusable template”.'
+            : 'Run setupSystem() once in the Apps Script editor to enable saved templates.');
+
+        mount.innerHTML = UI.grid('g-2-1',
+          UI.card({ title: 'Compose', sub: audience.total + ' active staff can be emailed', body: composeBody,
+            actions: '<button class="btn btn-brand" data-act="send">Send email</button>' }) +
+          UI.card({ title: 'Templates', sub: templates.length + ' saved', body: '<div id="emTplList">' + tplBody + '</div>' }));
+
+        var valueWrap = mount.querySelector('#emValueWrap');
+        var countBox = mount.querySelector('#emCount');
+        var scopeSel = mount.querySelector('#emScope');
+
+        function selectedIds() {
+          return Array.prototype.slice.call(mount.querySelectorAll('input[name="emStaff"]:checked'))
+            .map(function (x) { return x.value; });
+        }
+        function currentValue() {
+          var scope = scopeSel.value;
+          if (scope === 'individual') return selectedIds();
+          var v = mount.querySelector('#emValue');
+          return v ? v.value : '';
+        }
+        function updateCount() {
+          var n = recipientsFor(scopeSel.value, currentValue()).length;
+          countBox.textContent = n + ' recipient' + (n === 1 ? '' : 's') + ' will receive this email.';
+        }
+        function drawValue() {
+          var scope = scopeSel.value;
+          if (scope === 'department') {
+            valueWrap.innerHTML = field('Department', '<select id="emValue">' +
+              opt(audience.departments.map(function (x) { return { value: x, label: x }; })) + '</select>');
+          } else if (scope === 'role') {
+            valueWrap.innerHTML = field('Role', '<select id="emValue">' +
+              opt(audience.roles.map(function (x) { return { value: x, label: x }; })) + '</select>');
+          } else if (scope === 'individual') {
+            valueWrap.innerHTML = field('Staff',
+              '<div style="max-height:210px;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:8px;display:grid;gap:2px">' +
+              (staff.length ? staff.map(function (s) {
+                return '<label class="check"><input type="checkbox" name="emStaff" value="' + esc(s.staffId) + '"> ' +
+                  '<span>' + esc(s.name) + ' <span class="muted small">· ' + esc(s.department || s.role || '—') + '</span></span></label>';
+              }).join('') : '<div class="muted small">No staff available.</div>') + '</div>');
+          } else {
+            valueWrap.innerHTML = '';
+          }
+          var v = mount.querySelector('#emValue');
+          if (v) v.addEventListener('change', updateCount);
+          mount.querySelectorAll('input[name="emStaff"]').forEach(function (n) { n.addEventListener('change', updateCount); });
+          updateCount();
+        }
+
+        scopeSel.addEventListener('change', drawValue);
+        mount.querySelector('#emSaveTpl').addEventListener('change', function () {
+          mount.querySelector('#emTplNameWrap').classList.toggle('hidden', !this.checked);
+        });
+        drawValue();
+
+        bind(mount, {
+          send: function () {
+            var scope = scopeSel.value;
+            var value = currentValue();
+            var subject = mount.querySelector('#emSubject').value.trim();
+            var body = mount.querySelector('#emBody').value.trim();
+            var saveTpl = mount.querySelector('#emSaveTpl').checked;
+            var tplName = saveTpl ? mount.querySelector('#emTplName').value.trim() : '';
+            if (!subject) { App.toast('Enter a subject.', 'warn'); return; }
+            if (!body) { App.toast('Write a message.', 'warn'); return; }
+            if ((scope === 'department' || scope === 'role') && !value) { App.toast('Choose a ' + scope + '.', 'warn'); return; }
+            if (scope === 'individual' && !value.length) { App.toast('Select at least one staff member.', 'warn'); return; }
+            if (saveTpl && !tplName) { App.toast('Name the template, or untick “save as a reusable template”.', 'warn'); return; }
+            var n = recipientsFor(scope, value).length;
+            if (!n) { App.toast('That audience has no staff with an email address.', 'warn'); return; }
+            App.confirm({ title: 'Send email',
+              message: 'Send “' + subject + '” to ' + n + ' recipient' + (n === 1 ? '' : 's') + '?',
+              confirmLabel: 'Send' }).then(function (ok) {
+              if (!ok) return;
+              App.busy(true);
+              App.api('api_emailSend', { scope: scope, value: value, subject: subject, body: body,
+                saveTemplate: saveTpl, templateName: tplName }).then(function (r) {
+                App.busy(false);
+                App.toast('Sent to ' + r.sent + ' of ' + r.recipients + ' recipient' +
+                  (r.recipients === 1 ? '' : 's') + (r.sender ? ' as ' + r.sender : '') + '.',
+                  r.failed ? 'warn' : 'good');
+                // Never let a partial failure disappear — name who did not get it.
+                if (r.failed && r.failures && r.failures.length) {
+                  App.modal({
+                    title: r.failed + ' recipient(s) did not receive it',
+                    body: '<p class="muted small">Everyone else was sent “' + esc(subject) + '”. ' +
+                      'These addresses failed:</p><div class="list">' +
+                      r.failures.map(function (f) {
+                        return '<div class="list-item flat"><div style="flex:1;min-width:0">' +
+                          '<div class="li-title">' + esc(f.email || f.name || '—') + '</div>' +
+                          '<div class="li-sub">' + esc(f.error || 'Unknown error') + '</div></div></div>';
+                      }).join('') + '</div>',
+                    actions: [{ label: 'Close' }]
+                  });
+                }
+                if (r.templateError) App.toast('Email sent, but the template could not be saved: ' + r.templateError, 'warn');
+                App.refresh();
+              }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+            });
+          },
+          'tpl-load': function (id) {
+            var t = templates.find(function (x) { return x.templateId === id; });
+            if (!t) return;
+            mount.querySelector('#emSubject').value = t.subject || '';
+            mount.querySelector('#emBody').value = t.body || '';
+            App.toast('Template “' + t.name + '” loaded into the composer.', 'good');
+          },
+          'tpl-del': function (id) {
+            var t = templates.find(function (x) { return x.templateId === id; });
+            App.confirm({ title: 'Delete template',
+              message: 'Delete the template “' + (t ? t.name : '') + '”? This cannot be undone.',
+              confirmLabel: 'Delete', tone: 'danger' }).then(function (ok) {
+              if (!ok) return;
+              App.api('api_emailTemplateDelete', { templateId: id })
+                .then(function () { App.toast('Template deleted.', 'good'); App.refresh(); })
+                .catch(function (e) { App.toast(e.message, 'bad'); });
+            });
+          }
+        });
+      });
+    }
+  };
+
+  /* ======================================================================
+     MODULE EXPORT
+     ====================================================================== */
+  window.AdminUI = {
+    defaultView: 'dashboard',
+    nav: [
+      { group: 'Overview', items: [{ id: 'dashboard', label: 'Dashboard', icon: '🏠' }] },
+      { group: 'Work', items: [
+        { id: 'tasks', label: 'Tasks', icon: '🗂️' },
+        { id: 'validation', label: 'Validation', icon: '✅' }
+      ] },
+      { group: 'People', items: [
+        { id: 'staff', label: 'Staff', icon: '👥' },
+        { id: 'attendance', label: 'Attendance', icon: '🕘' },
+        { id: 'discipline', label: 'Discipline', icon: '⚠️' }
+      ] },
+      { group: 'Finance', items: [
+        { id: 'payroll', label: 'Payroll', icon: '💰' },
+        { id: 'allocation', label: 'Allocation', icon: '🧮' },
+        { id: 'reports', label: 'Reports', icon: '📊' }
+      ] },
+      { group: 'Workspace', items: [
+        { id: 'email', label: 'Email', icon: '✉️' },
+        { id: 'documents', label: 'Documents', icon: '📁' },
+        { id: 'settings', label: 'Settings', icon: '⚙️' }
+      ] }
+    ],
+    views: views
+  };
+})();
+</script>

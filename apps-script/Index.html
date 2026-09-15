@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><?= companyName ?> — Workspace</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <?!= include('Styles') ?>
+</head>
+<body>
+
+  <!-- ===================== Boot splash ===================== -->
+  <div id="splash" class="splash">
+    <div class="splash-box">
+      <div class="brand-mark lg" id="splashMark">
+        <? if (companyLogoUrl) { ?>
+          <img src="<?= companyLogoUrl ?>" alt="<?= companyName ?>">
+        <? } else { ?>✓<? } ?>
+      </div>
+      <div class="splash-title"><?= companyName ?></div>
+      <div class="splash-sub">Loading your workspace…</div>
+      <div class="splash-bar"><span></span></div>
+    </div>
+  </div>
+
+  <!-- ===================== Login ===================== -->
+  <div id="loginRoot" class="hidden"></div>
+
+  <!-- ===================== Application shell ===================== -->
+  <div id="appRoot" class="shell hidden">
+
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <div class="logo">
+          <span class="brand-mark" id="brandMark">
+            <? if (companyLogoUrl) { ?>
+              <img src="<?= companyLogoUrl ?>" alt="<?= companyName ?>">
+            <? } else { ?>✓<? } ?>
+          </span>
+          <span class="logo-text" id="brandName"><?= companyName ?></span>
+        </div>
+        <button class="icon-btn only-mobile" id="closeNav" title="Close menu">✕</button>
+      </div>
+
+      <nav class="nav" id="navMain"></nav>
+
+      <div class="nav-foot">
+        <div class="promo">
+          <div class="promo-icon">↑</div>
+          <div>
+            <div class="promo-title" id="promoTitle">Upload a document</div>
+            <div class="promo-sub" id="promoSub">Submit deliverables straight to Drive.</div>
+          </div>
+        </div>
+        <button class="btn btn-brand w-full" id="btnUploadSide">Upload document</button>
+        <button class="btn btn-ghost w-full" id="btnLogout">Sign out</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-btn only-mobile" id="openNav" title="Menu">☰</button>
+          <div>
+            <h1 class="page-title" id="pageTitle">Dashboard</h1>
+            <p class="page-sub" id="pageSub">&nbsp;</p>
+          </div>
+        </div>
+
+        <div class="topbar-right">
+          <div class="search">
+            <span>⌕</span>
+            <input id="globalSearch" type="search" placeholder="Search tasks, staff, documents…" autocomplete="off">
+          </div>
+          <select class="period-select" id="periodSelect" title="Reporting period"></select>
+          <button class="icon-btn bell" id="btnBell" title="Notifications">
+            <span>🔔</span><i class="dot hidden" id="bellDot"></i>
+          </button>
+          <button class="icon-btn" id="btnRefresh" title="Refresh">⟳</button>
+          <div class="me" id="meChip"></div>
+        </div>
+      </header>
+
+      <div id="banner"></div>
+      <section id="view" class="view"></section>
+      <footer class="foot">
+        <span id="footStamp"></span>
+        <span class="foot-sep">·</span>
+        <span>Pay basis: <strong id="footBasis">—</strong></span>
+        <span class="foot-sep">·</span>
+        <span>Timezone: <strong id="footTz">—</strong></span>
+      </footer>
+    </main>
+  </div>
+
+  <!-- ===================== Overlays ===================== -->
+  <div id="drawer" class="drawer hidden">
+    <div class="drawer-head">
+      <strong>Notifications</strong>
+      <div class="row-gap">
+        <button class="btn btn-ghost sm" id="btnReadAll">Mark all read</button>
+        <button class="icon-btn" id="closeDrawer">✕</button>
+      </div>
+    </div>
+    <div class="drawer-body" id="drawerBody"></div>
+  </div>
+
+  <div id="modalRoot" class="modal-wrap hidden">
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <h3 id="modalTitle">Title</h3>
+        <button class="icon-btn" data-close="1">✕</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-foot" id="modalFoot"></div>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+  <div id="busy" class="busy hidden"><div class="spinner"></div></div>
+
+  <script>window.BOOT_PAGE = '<?= bootPage ?>';</script>
+  <?!= include('Login') ?>
+  <?!= include('AdminDashboard') ?>
+  <?!= include('StaffPortal') ?>
+  <?!= include('Perf') ?>
+  <?!= include('Scripts') ?>
+</body>
+</html>

@@ -1,0 +1,152 @@
+<!--
+  EmailTemplate.html — the single HtmlService template behind every email.
+  Rendered by Notifications.gs → Notify.render(o):
+     data = {
+       company,                       // brand name
+       logoUrl,                       // Config.CompanyLogoUrl ('' = show initial)
+       title, intro,                  // heading + lead paragraph (plain text)
+       rows: [[label, value], ...],   // optional key/value facts table
+       body,                          // optional raw HTML block
+       cta: {label, url} | null,      // optional call-to-action button
+       accent: 'navy'|'red'|'amber',  // colour of the header bar + button
+       footnote,                      // small print under the divider
+       year                           // 'yyyy'
+     }
+  This is a top-level template (createTemplateFromFile + evaluate) so scriptlets
+  are evaluated here. IMPORTANT: never write a scriptlet delimiter inside this
+  comment — the compiler scans comments too, and an empty scriptlet is a syntax
+  error that breaks every email in the system. Email clients ignore most style
+  blocks, so every visual rule is inlined and the layout is table-based.
+-->
+<? var ACCENTS = { navy: '#0B2447', blue: '#0B2447', green: '#0B2447',
+                   amber: '#B45309', red: '#B42318' };
+   var accent = ACCENTS[data.accent] || ACCENTS.navy;
+   var accentSoft = { navy: '#EEF2F8', blue: '#EEF2F8', green: '#EEF2F8',
+                      amber: '#FEF3C7', red: '#FEE4E2' }[data.accent] || '#EEF2F8';
+   var ink = '#0f172a', muted = '#64748b'; ?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title><?= data.title ?></title>
+</head>
+<body style="margin:0;padding:0;background:#f1f5f9;-webkit-text-size-adjust:100%;">
+  <!-- preheader: hidden preview text -->
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#f1f5f9;font-size:1px;line-height:1px;">
+    <?= data.intro ? data.intro : data.title ?>
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+         style="background:#f1f5f9;padding:24px 12px;">
+    <tr>
+      <td align="center">
+
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0"
+               style="width:600px;max-width:600px;background:#ffffff;border-radius:16px;overflow:hidden;
+                      border:1px solid #e5e8ec;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+
+          <!-- brand / accent header -->
+          <tr>
+            <td style="background:<?= accent ?>;padding:22px 28px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="font-size:16px;font-weight:700;color:#ffffff;letter-spacing:.2px;">
+                    <? if (data.logoUrl) { ?>
+                      <img src="<?= data.logoUrl ?>" alt="<?= data.company ?>" height="26"
+                           style="height:26px;max-height:26px;width:auto;border:0;display:inline-block;
+                                  vertical-align:middle;margin-right:9px;">
+                    <? } ?><span style="vertical-align:middle;"><?= data.company ?></span>
+                  </td>
+                  <td align="right" style="font-size:12px;color:rgba(255,255,255,.85);">
+                    Task · Attendance · Payroll
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- body -->
+          <tr>
+            <td style="padding:30px 28px 8px 28px;">
+              <h1 style="margin:0 0 10px 0;font-size:21px;line-height:1.3;color:<?= ink ?>;font-weight:700;">
+                <?= data.title ?>
+              </h1>
+              <? if (data.intro) { ?>
+                <p style="margin:0 0 18px 0;font-size:15px;line-height:1.6;color:<?= muted ?>;">
+                  <?= data.intro ?>
+                </p>
+              <? } ?>
+
+              <!-- facts table -->
+              <? if (data.rows && data.rows.length) { ?>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+                       style="border:1px solid #e5e8ec;border-radius:12px;border-collapse:separate;
+                              overflow:hidden;margin:0 0 18px 0;background:<?= accentSoft ?>;">
+                  <? for (var i = 0; i < data.rows.length; i++) { var r = data.rows[i]; ?>
+                    <tr>
+                      <td style="padding:10px 14px;font-size:13px;color:<?= muted ?>;
+                                 border-top:<?= i ? '1px solid #e5e8ec' : 'none' ?>;width:42%;">
+                        <?= r[0] ?>
+                      </td>
+                      <td style="padding:10px 14px;font-size:14px;font-weight:600;color:<?= ink ?>;
+                                 border-top:<?= i ? '1px solid #e5e8ec' : 'none' ?>;">
+                        <?= r[1] ?>
+                      </td>
+                    </tr>
+                  <? } ?>
+                </table>
+              <? } ?>
+
+              <!-- free HTML block -->
+              <? if (data.body) { ?>
+                <div style="font-size:15px;line-height:1.65;color:<?= ink ?>;">
+                  <?!= data.body ?>
+                </div>
+              <? } ?>
+
+              <!-- call to action -->
+              <? if (data.cta && data.cta.url) { ?>
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:22px 0 6px 0;">
+                  <tr>
+                    <td align="center" bgcolor="<?= accent ?>" style="border-radius:10px;">
+                      <a href="<?= data.cta.url ?>" target="_blank"
+                         style="display:inline-block;padding:12px 26px;font-size:15px;font-weight:600;
+                                color:#ffffff;text-decoration:none;border-radius:10px;">
+                        <?= data.cta.label ?>
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+              <? } ?>
+            </td>
+          </tr>
+
+          <!-- footnote -->
+          <tr>
+            <td style="padding:14px 28px 26px 28px;">
+              <hr style="border:none;border-top:1px solid #e5e8ec;margin:8px 0 14px 0;">
+              <? if (data.footnote) { ?>
+                <p style="margin:0 0 8px 0;font-size:12px;line-height:1.5;color:<?= muted ?>;">
+                  <?= data.footnote ?>
+                </p>
+              <? } ?>
+              <p style="margin:0;font-size:11px;line-height:1.5;color:#94a3b8;">
+                Automated message from the <?= data.company ?> workspace
+                &middot; &copy; <?= data.year ?> <?= data.company ?>.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+
+        <div style="font-size:11px;color:#94a3b8;padding:14px 0 0 0;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+          Progress-based allocation pay &middot; Google Drive document storage
+        </div>
+
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

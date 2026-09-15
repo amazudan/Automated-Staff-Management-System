@@ -1,0 +1,834 @@
+<script>
+/* ==========================================================================
+   Scripts.html — shared client runtime.
+   ----------------------------------------------------------------------------
+   • App     — session, API calls, shell wiring, view router, overlays.
+   • UI       — pure render helpers (cards, KPIs, bar chart, gauge, tables…).
+   Login.html, AdminDashboard.html and StaffPortal.html are included BEFORE this
+   file, so window.LoginUI / AdminUI / StaffUI already exist when boot() runs.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  /* -------------------------------------------------------------- helpers */
+  var $ = function (id) { return document.getElementById(id); };
+  var el = function (tag, cls, html) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (html != null) n.innerHTML = html;
+    return n;
+  };
+
+  var App = window.App = {
+    state: {
+      token: '',
+      profile: null,
+      config: {},
+      role: 'Staff',
+      view: null,
+      period: 'Monthly',
+      unread: 0,
+      search: ''
+    },
+    _viewCache: {},        // PERF: cache rendered views for 5min
+    _cacheTime: 300000,    // 5 minutes
+    _searchTimeout: null   // PERF: debounce search
+  };
+
+  /* ============================================================ API layer */
+
+  /** Low-level: call a server function, resolve its raw return value. */
+  function grun(method, args) {
+    return new Promise(function (resolve, reject) {
+      if (!(window.google && google.script && google.script.run)) {
+        reject(new Error('Open this app from its Apps Script web-app URL.'));
+        return;
+      }
+      var r = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(function (err) {
+          reject(new Error(err && err.message ? err.message : String(err)));
+        });
+      r[method].apply(r, args || []);
+    });
+  }
+
+  /** Unwrap the {ok,data,error,authRequired} envelope. */
+  function unwrap(env) {
+    env = env || {};
+    if (env.ok) return env.data;
+    if (env.authRequired) { App.onAuthLost(); throw new Error('AUTH'); }
+    throw new Error(env.error || 'Something went wrong.');
+  }
+
+  /** Public call — no token prepended (bootstrap / login / logout). */
+  App.public = function (method, args) {
+    return grun(method, args || []).then(unwrap);
+  };
+
+  /** Authenticated call — prepends the session token. `payload` optional. */
+  App.api = function (method, payload) {
+    var args = [App.state.token];
+    if (payload !== undefined) args.push(payload);
+    return grun(method, args).then(unwrap);
+  };
+
+  /* ============================================================== overlays */
+
+  App.busy = function (on) { $('busy').classList.toggle('hidden', !on); };
+
+  App.toast = function (msg, kind, ms) {
+    var t = el('div', 'toast ' + (kind || ''), UI.esc(msg));
+    $('toasts').appendChild(t);
+    setTimeout(function () {
+      t.style.transition = 'opacity .3s'; t.style.opacity = '0';
+      setTimeout(function () { t.remove(); }, 300);
+    }, ms || 3600);
+  };
+
+  /**
+   * Open the modal.
+   * @param {Object} o {title, body:HTML, wide, actions:[{label,tone,onClick,close,keepOpen}], onOpen}
+   * onClick receives ({close, root, values}) — return a promise to keep the
+   * button spinner up until it settles.
+   */
+  App.modal = function (o) {
+    o = o || {};
+    var root = $('modalRoot');
+    $('modalTitle').textContent = o.title || '';
+    $('modalBody').innerHTML = o.body || '';
+    root.querySelector('.modal').classList.toggle('wide', !!o.wide);
+
+    var foot = $('modalFoot');
+    foot.innerHTML = '';
+    (o.actions || [{ label: 'Close', close: true }]).forEach(function (a) {
+      var b = el('button', 'btn ' + (a.tone ? 'btn-' + a.tone : ''), UI.esc(a.label));
+      b.addEventListener('click', function () {
+        if (!a.onClick) { if (a.close !== false) App.closeModal(); return; }
+        var ctx = {
+          close: App.closeModal,
+          root: $('modalBody'),
+          values: function () { return App.collect($('modalBody')); }
+        };
+        var out = a.onClick(ctx);
+        if (out && out.then) {
+          b.disabled = true; var old = b.innerHTML; b.innerHTML = '…';
+          out.then(function () { if (a.close !== false && !a.keepOpen) App.closeModal(); })
+             .catch(function (e) { App.toast(e.message || 'Failed', 'bad'); })
+             .then(function () { b.disabled = false; b.innerHTML = old; });
+        } else if (a.close !== false && !a.keepOpen) {
+          App.closeModal();
+        }
+      });
+      foot.appendChild(b);
+    });
+
+    root.classList.remove('hidden');
+    if (o.onOpen) o.onOpen($('modalBody'));
+    var first = $('modalBody').querySelector('input,select,textarea');
+    if (first) try { first.focus(); } catch (e) {}
+  };
+  App.closeModal = function () { $('modalRoot').classList.add('hidden'); };
+
+  App.confirm = function (o) {
+    o = o || {};
+    return new Promise(function (resolve) {
+      App.modal({
+        title: o.title || 'Please confirm',
+        body: '<p>' + UI.esc(o.message || 'Are you sure?') + '</p>' +
+              (o.note ? '<div class="field mt"><label>' + UI.esc(o.noteLabel || 'Note') +
+                 '</label><textarea data-field="note" placeholder="' +
+                 UI.esc(o.notePlaceholder || '') + '"></textarea></div>' : ''),
+        actions: [
+          { label: o.cancelLabel || 'Cancel', onClick: function (c) { c.close(); resolve(null); } },
+          { label: o.confirmLabel || 'Confirm', tone: o.tone || 'brand',
+            onClick: function (c) {
+              var note = o.note ? (App.collect(c.root).note || '') : true;
+              if (o.note && o.requireNote && !String(note).trim()) {
+                App.toast('A note is required.', 'warn'); return;
+              }
+              c.close(); resolve(o.note ? note : true);
+            } }
+        ]
+      });
+    });
+  };
+
+  /** Collect [data-field] values inside a container into a plain object. */
+  App.collect = function (root) {
+    var out = {};
+    root.querySelectorAll('[data-field]').forEach(function (n) {
+      var key = n.getAttribute('data-field');
+      var type = n.getAttribute('data-type');
+      if (n.type === 'checkbox') out[key] = n.checked;
+      else if (type === 'number') out[key] = n.value === '' ? '' : Number(n.value);
+      else if (type === 'list')
+        out[key] = n.value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+      else if (type === 'multi' || n.multiple)
+        out[key] = Array.prototype.slice.call(n.selectedOptions || [])
+          .map(function (o) { return o.value; });
+      else out[key] = n.value;
+    });
+    return out;
+  };
+
+  App.download = function (url) { if (url) window.open(url, '_blank'); };
+
+  /* =========================================================== notifications */
+
+  App.setUnread = function (n) {
+    App.state.unread = n || 0;
+    $('bellDot').classList.toggle('hidden', !App.state.unread);
+  };
+
+  App.openDrawer = function () {
+    $('drawer').classList.remove('hidden');
+    var body = $('drawerBody');
+    body.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+    App.api('api_notifications', { limit: 30 }).then(function (d) {
+      App.setUnread(d.unread);
+      if (!d.items.length) { body.innerHTML = UI.empty('🔔', 'No notifications yet'); return; }
+      body.innerHTML = d.items.map(function (n) {
+        return '<div class="note ' + (n.read ? '' : 'unread') + '" data-id="' + n.id +
+          '" data-link="' + UI.esc(n.link || '') + '">' +
+          '<span class="n-dot ' + UI.esc(n.severity) + '"></span>' +
+          '<div style="min-width:0"><div class="li-title">' + UI.esc(n.title) + '</div>' +
+          '<div class="li-sub">' + UI.esc(n.message) + '</div>' +
+          '<div class="small muted" style="margin-top:2px">' + UI.esc(n.ago) + '</div></div></div>';
+      }).join('');
+      body.querySelectorAll('.note').forEach(function (row) {
+        row.addEventListener('click', function () {
+          var id = row.getAttribute('data-id'), link = row.getAttribute('data-link');
+          if (!row.classList.contains('unread')) { if (link) App.download(link); return; }
+          App.api('api_notificationRead', { notificationId: id }).then(function () {
+            row.classList.remove('unread');
+            App.setUnread(Math.max(0, App.state.unread - 1));
+            if (link) App.download(link);
+          });
+        });
+      });
+    }).catch(function (e) { body.innerHTML = UI.empty('⚠', e.message); });
+  };
+  App.closeDrawer = function () { $('drawer').classList.add('hidden'); };
+
+  /* ============================================================ file upload */
+
+  function readFileAsBase64(file) {
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () {
+        var s = String(fr.result);
+        resolve({
+          fileName: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          sizeBytes: file.size,
+          dataBase64: s.substring(s.indexOf(',') + 1)
+        });
+      };
+      fr.onerror = function () { reject(new Error('Could not read the file.')); };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  /**
+   * Staff directory for admin pickers, fetched once per session.
+   * @return {Promise<Array>} [{staffId, name, department, role, email}]
+   */
+  App.staffDirectory = function () {
+    if (!(App.state.profile && App.state.profile.isAdmin)) return Promise.resolve([]);
+    if (App._directory) return Promise.resolve(App._directory);
+    return App.api('api_staffDirectory').then(function (rows) {
+      App._directory = rows || [];
+      return App._directory;
+    }).catch(function () { return []; });
+  };
+
+  /**
+   * Upload dialog, shared by both roles.
+   * @param {Object} opts {taskId, taskTitle, category, staffId, staffName, visibility}
+   * `staffId` pre-selects a single recipient, which is how an admin sends a
+   * document to one person instead of the whole workforce (requirement 6).
+   */
+  App.openUpload = function (opts) {
+    opts = opts || {};
+    var cats = App.state.config.uploadCategories || ['Other'];
+    var isAdmin = App.state.profile && App.state.profile.isAdmin;
+    var maxMb = App.state.config.maxUploadMB || 25;
+    var allowed = App.state.config.allowedExtensions || [];
+    var preselect = opts.staffId ? String(opts.staffId) : '';
+    var startVisibility = opts.visibility || (preselect ? 'Individual' : 'Staff');
+
+    var visibilityField = isAdmin
+      ? '<div class="field"><label>Who can see it</label><select data-field="visibility" id="upVis">' +
+          '<option value="Private"' + (startVisibility === 'Private' ? ' selected' : '') +
+            '>Only me &amp; admins</option>' +
+          '<option value="Individual"' + (startVisibility === 'Individual' ? ' selected' : '') +
+            '>Selected staff only</option>' +
+          '<option value="Staff"' + (startVisibility === 'Staff' ? ' selected' : '') +
+            '>All staff</option>' +
+          '<option value="All"' + (startVisibility === 'All' ? ' selected' : '') +
+            '>Everyone</option></select></div>'
+      : '<div class="field"><label>Visibility</label>' +
+        '<input type="text" value="Private (you &amp; admins)" disabled></div>';
+
+    App.modal({
+      title: opts.taskTitle ? 'Upload to a task' : 'Upload a document',
+      body:
+        '<div class="drop" id="dz"><div class="d-ico">↑</div>' +
+        '<div style="margin-top:6px"><strong>Click to choose</strong> or drag a file here</div>' +
+        '<div class="small muted" id="dzHint">Up to ' + maxMb + ' MB' +
+          (allowed.length ? ' · ' + allowed.join(', ') : '') + '</div></div>' +
+        '<input type="file" id="dzInput" style="display:none">' +
+        '<div id="dzChosen" class="mt small"></div>' +
+        (opts.taskTitle
+          ? '<div class="field mt"><label>Attached to task</label>' +
+            '<input type="text" value="' + UI.esc(opts.taskTitle) + '" disabled></div>'
+          : '') +
+        '<div class="form-2 mt">' +
+          '<div class="field"><label>Category</label><select data-field="category">' +
+            cats.map(function (c) {
+              return '<option value="' + c + '"' +
+                (c === opts.category ? ' selected' : '') + '>' + UI.esc(c) + '</option>';
+            }).join('') + '</select></div>' +
+          visibilityField +
+        '</div>' +
+        (isAdmin
+          ? '<div class="field' + (startVisibility === 'Individual' ? '' : ' hidden') + '" id="upAudienceWrap">' +
+            '<label>Send to</label>' +
+            '<select data-field="audienceStaffIds" data-type="multi" id="upAudience" multiple size="6">' +
+            (preselect
+              ? '<option value="' + UI.esc(preselect) + '" selected>' +
+                UI.esc(opts.staffName || preselect) + '</option>'
+              : '<option disabled>Loading staff…</option>') +
+            '</select>' +
+            '<div class="small muted" style="margin-top:4px">Hold Ctrl (⌘ on Mac) to pick more than one.</div>' +
+            '</div>'
+          : '') +
+        '<div class="field"><label>Description (optional)</label>' +
+        '<textarea data-field="description" placeholder="What is this file?"></textarea></div>',
+      actions: [
+        { label: 'Cancel' },
+        { label: 'Upload', tone: 'brand', keepOpen: true, close: false, onClick: function (c) {
+          var input = document.getElementById('dzInput');
+          if (!input.files || !input.files[0]) { App.toast('Choose a file first.', 'warn'); return; }
+          var file = input.files[0];
+          if (file.size > maxMb * 1048576) {
+            App.toast('That file is larger than ' + maxMb + ' MB.', 'bad'); return;
+          }
+          var v = c.values();
+          var audience = v.audienceStaffIds || [];
+          if (v.visibility === 'Individual' && !audience.length) {
+            App.toast('Choose at least one staff member to send it to.', 'warn'); return;
+          }
+          return readFileAsBase64(file).then(function (f) {
+            return App.api('api_upload', {
+              fileName: f.fileName, mimeType: f.mimeType, dataBase64: f.dataBase64,
+              category: v.category, visibility: v.visibility,
+              audienceStaffIds: audience,
+              description: v.description, taskId: opts.taskId || ''
+            });
+          }).then(function () {
+            App.closeModal();
+            App.toast('Uploaded to Google Drive.', 'good');
+            App.refresh();
+          });
+        } }
+      ],
+      onOpen: function (root) {
+        var dz = root.querySelector('#dz'), input = root.querySelector('#dzInput');
+        var chosen = root.querySelector('#dzChosen');
+        var show = function (f) {
+          chosen.innerHTML = f
+            ? '<div class="file-row"><span class="file-ico">📄</span><div><strong>' +
+              UI.esc(f.name) + '</strong><div class="muted">' +
+              Math.round(f.size / 1024) + ' KB</div></div></div>'
+            : '';
+        };
+        dz.addEventListener('click', function () { input.click(); });
+        input.addEventListener('change', function () { show(input.files[0]); });
+        ['dragover', 'dragenter'].forEach(function (ev) {
+          dz.addEventListener(ev, function (e) { e.preventDefault(); dz.classList.add('over'); });
+        });
+        ['dragleave', 'drop'].forEach(function (ev) {
+          dz.addEventListener(ev, function (e) { e.preventDefault(); dz.classList.remove('over'); });
+        });
+        dz.addEventListener('drop', function (e) {
+          if (e.dataTransfer.files[0]) { input.files = e.dataTransfer.files; show(input.files[0]); }
+        });
+
+        var vis = root.querySelector('#upVis');
+        var wrap = root.querySelector('#upAudienceWrap');
+        var picker = root.querySelector('#upAudience');
+        if (vis && wrap) {
+          vis.addEventListener('change', function () {
+            wrap.classList.toggle('hidden', vis.value !== 'Individual');
+          });
+        }
+        if (picker) {
+          App.staffDirectory().then(function (rows) {
+            if (!rows.length) {
+              picker.innerHTML = '<option disabled>No staff on file</option>';
+              return;
+            }
+            picker.innerHTML = rows.map(function (s) {
+              return '<option value="' + UI.esc(s.staffId) + '"' +
+                (String(s.staffId) === preselect ? ' selected' : '') + '>' +
+                UI.esc(s.name) + (s.department ? ' · ' + UI.esc(s.department) : '') + '</option>';
+            }).join('');
+          });
+        }
+      }
+    });
+  };
+
+  /* ================================================================ shell */
+
+  App.activeUI = function () {
+    return (App.state.profile && App.state.profile.isAdmin) ? window.AdminUI : window.StaffUI;
+  };
+
+  App.period = function () { return App.state.period; };
+
+  App.periodLabel = function (t) {
+    return t === 'HalfYearly' ? 'Half-Yearly' : t;
+  };
+
+  App.setBadge = function (viewId, count) {
+    var item = document.querySelector('.nav-item[data-view="' + viewId + '"] .count');
+    var host = document.querySelector('.nav-item[data-view="' + viewId + '"]');
+    if (!host) return;
+    if (count) {
+      if (item) item.textContent = count;
+      else { var c = el('span', 'count', count); host.appendChild(c); }
+    } else if (item) { item.remove(); }
+  };
+
+  function renderNav() {
+    var ui = App.activeUI(), nav = $('navMain');
+    nav.innerHTML = (ui.nav || []).map(function (grp) {
+      return (grp.group ? '<div class="nav-group">' + UI.esc(grp.group) + '</div>' : '') +
+        grp.items.map(function (it) {
+          return '<button class="nav-item" data-view="' + it.id + '">' +
+            '<span class="ico">' + (it.icon || '•') + '</span>' +
+            '<span>' + UI.esc(it.label) + '</span>' +
+            (it.count ? '<span class="count">' + it.count + '</span>' : '') + '</button>';
+        }).join('');
+    }).join('');
+    nav.querySelectorAll('.nav-item').forEach(function (b) {
+      b.addEventListener('click', function () { App.setView(b.getAttribute('data-view')); });
+    });
+  }
+
+  /**
+   * Paint the company logo (Config.CompanyLogoUrl) into every brand mark, or
+   * fall back to the tick. Requirement 10.
+   */
+  App.applyBrand = function () {
+    var url = App.state.config.companyLogoUrl || '';
+    var name = App.state.config.companyName || 'Staff Management';
+    ['brandMark', 'splashMark'].forEach(function (id) {
+      var n = $(id);
+      if (!n) return;
+      n.innerHTML = url
+        ? '<img src="' + UI.esc(url) + '" alt="' + UI.esc(name) + '">'
+        : '✓';
+    });
+    document.title = name + ' — Workspace';
+  };
+
+  function renderMe() {
+    var p = App.state.profile;
+    $('meChip').innerHTML = UI.avatar(p) +
+      '<div class="who"><b>' + UI.esc(p.name) + '</b><small>' + UI.esc(p.role) +
+      (p.department ? ' · ' + UI.esc(p.department) : '') + '</small></div>';
+    $('brandName').textContent = App.state.config.companyName || 'Staff Management';
+    App.applyBrand();
+    if (p.isAdmin) {
+      $('promoTitle').textContent = 'Share a document';
+      $('promoSub').textContent = 'Policies, forms and payslips to Drive.';
+    }
+  }
+
+  function renderPeriodSelect() {
+    var sel = $('periodSelect');
+    sel.innerHTML = (App.state.config.periodTypes || ['Monthly']).map(function (t) {
+      return '<option value="' + t + '"' + (t === App.state.period ? ' selected' : '') +
+        '>' + UI.esc(App.periodLabel(t)) + '</option>';
+    }).join('');
+  }
+
+  function renderFooter() {
+    var c = App.state.config;
+    $('footStamp').textContent = 'Signed in as ' + App.state.profile.email;
+    $('footBasis').textContent = c.payBasis === 'ReportedProgress'
+      ? 'Reported progress' : 'Admin-validated progress';
+    $('footTz').textContent = c.timezone || '—';
+  }
+
+  /** Route to a view of the active UI module and render it into #view. */
+  App.setView = function (id) {
+    var ui = App.activeUI();
+    var view = ui.views[id];
+    if (!view) { id = ui.defaultView; view = ui.views[id]; }
+    App.state.view = id;
+
+    document.querySelectorAll('.nav-item').forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-view') === id);
+    });
+    var title = typeof view.title === 'function' ? view.title() : (view.title || '');
+    var sub = typeof view.sub === 'function' ? view.sub() : (view.sub || '');
+    $('pageTitle').textContent = title;
+    $('pageSub').innerHTML = sub || '&nbsp;';
+    $('appRoot').querySelector('.sidebar').classList.remove('open');
+
+    var mount = $('view');
+
+    // IMPORTANT: do not re-use cached raw HTML for interactive views. The click
+    // handlers are attached in each render() call and are lost if we insert stale
+    // HTML back into the DOM. We keep the other performance improvements in the
+    // API/data layer and only avoid stale DOM reuse here.
+    mount.innerHTML = '';
+    App.busy(true);
+    Promise.resolve()
+      .then(function () { return view.render(mount); })
+      .catch(function (e) {
+        if (e.message === 'AUTH') return;
+        mount.innerHTML = UI.empty('⚠', 'Could not load this view', e.message);
+        App.toast(e.message, 'bad');
+      })
+      .then(function () {
+        App.busy(false);
+        applySearch();
+        Perf.lazyLoadImages(mount);
+        Perf.wirePaginatedTable(mount);
+      });
+  };
+
+  App.refresh = function () { 
+    // PERF: Clear cache on refresh to force reload
+    App._viewCache = {};
+    if (App.state.view) App.setView(App.state.view); 
+  };
+
+  /* client-side filter across whatever the current view rendered */
+  function applySearch() {
+    var q = App.state.search.trim().toLowerCase();
+    $('view').querySelectorAll('[data-search]').forEach(function (n) {
+      n.style.display = (!q || n.getAttribute('data-search').toLowerCase().indexOf(q) !== -1)
+        ? '' : 'none';
+    });
+    // PERF: Lazy-load images when search filter runs
+    Perf.lazyLoadImages($('view'));
+  }
+
+  /* ============================================================= sessions */
+
+  App.showApp = function () {
+    $('splash').classList.add('hidden');
+    $('loginRoot').classList.add('hidden');
+    $('appRoot').classList.remove('hidden');
+    App.state.role = App.state.profile.role;
+    renderNav(); renderMe(); renderPeriodSelect(); renderFooter();
+    App.setView(App.activeUI().defaultView);
+  };
+
+  App.showLogin = function () {
+    $('splash').classList.add('hidden');
+    $('appRoot').classList.add('hidden');
+    $('loginRoot').classList.remove('hidden');
+    window.LoginUI.mount($('loginRoot'));
+  };
+
+  /** Called by LoginUI after a successful sign-in. */
+  App.onAuthenticated = function (out) {
+    App.state.token = out.token || '';
+    if (App.state.token) sessionStorage.setItem('sms_token', App.state.token);
+    App.state.profile = out.profile;
+    if (out.config) App.state.config = out.config;
+    App._directory = null;          // a new session gets a fresh staff picker
+    App.showApp();
+  };
+
+  App.onAuthLost = function () {
+    sessionStorage.removeItem('sms_token');
+    App.state.token = ''; App.state.profile = null;
+    App._directory = null;
+    App.showLogin();
+    App.toast('Your session expired — please sign in again.', 'warn');
+  };
+
+  App.logout = function () {
+    var t = App.state.token;
+    sessionStorage.removeItem('sms_token');
+    App.state.token = ''; App.state.profile = null;
+    App._directory = null;
+    App.public('api_logout', [t]).catch(function () {});
+    App.showLogin();
+  };
+
+  /**
+   * Ask the server who we are. The login screen is what a visitor sees unless
+   * the browser is holding a live session token (requirement 8) — being signed
+   * in to Google as the deployment owner is not a sign-in.
+   * @return {Promise} resolves once the screen has been decided
+   */
+  App.boot = function () {
+    var token = sessionStorage.getItem('sms_token') || '';
+    App.state.token = token;
+    // PERF: Initialize IndexedDB cache in background
+    Perf.initDB().catch(function () {});
+    return App.public('api_bootstrap', [token]).then(function (b) {
+      App.bootInfo = b;
+      App.state.config = b.config || {};
+      if (b.signedIn && b.profile) { App.onAuthenticated({ token: token, profile: b.profile }); }
+      else {
+        sessionStorage.removeItem('sms_token');
+        App.state.token = '';
+        App.applyBrand();
+        App.showLogin();
+      }
+      return b;
+    }).catch(function (e) {
+      $('splash').innerHTML = '<div class="splash-box"><div class="brand-mark lg">!</div>' +
+        '<div class="splash-title">Could not start</div>' +
+        '<div class="splash-sub">' + UI.esc(e.message) + '</div></div>';
+      throw e;
+    });
+  };
+
+  /* ============================================================== wiring */
+
+  function wireShell() {
+    $('btnLogout').addEventListener('click', App.logout);
+    $('btnRefresh').addEventListener('click', App.refresh);
+    $('btnUploadSide').addEventListener('click', function () { App.openUpload(); });
+    $('btnBell').addEventListener('click', App.openDrawer);
+    $('closeDrawer').addEventListener('click', App.closeDrawer);
+    $('btnReadAll').addEventListener('click', function () {
+      App.api('api_notificationRead', { all: true }).then(function () {
+        App.setUnread(0); App.openDrawer();
+      });
+    });
+    $('openNav').addEventListener('click', function () {
+      $('appRoot').querySelector('.sidebar').classList.add('open');
+    });
+    $('closeNav').addEventListener('click', function () {
+      $('appRoot').querySelector('.sidebar').classList.remove('open');
+    });
+    $('periodSelect').addEventListener('change', function (e) {
+      App.state.period = e.target.value; App.refresh();
+    });
+    $('globalSearch').addEventListener('input', function (e) {
+      App.state.search = e.target.value; 
+      // PERF: Debounce search filter to avoid excessive DOM queries
+      if (App._searchTimeout) clearTimeout(App._searchTimeout);
+      App._searchTimeout = setTimeout(applySearch, 300);
+    });
+    $('modalRoot').addEventListener('click', function (e) {
+      if (e.target.getAttribute('data-close')) App.closeModal();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { App.closeModal(); App.closeDrawer(); }
+    });
+  }
+
+  /* ================================================================== UI */
+
+  var TASK_TONE = {
+    Completed: 'green', PendingValidation: 'amber', InProgress: 'blue',
+    Acknowledged: 'blue', Assigned: 'blue', Scheduled: 'grey',
+    Failed: 'red', Cancelled: 'grey'
+  };
+  var TASK_LABEL = {
+    PendingValidation: 'Yet to validate', InProgress: 'In progress',
+    Scheduled: 'Scheduled', Assigned: 'Assigned', Acknowledged: 'Acknowledged',
+    Completed: 'Completed', Failed: 'Failed', Cancelled: 'Cancelled'
+  };
+  var STAFF_TONE = { Active: 'green', Suspended: 'red', Inactive: 'grey' };
+  var ATT_TONE = { OnTime: 'green', Late: 'amber', Absent: 'red', Leave: 'blue',
+                   Holiday: 'grey', NotSigned: 'grey' };
+  var ATT_LABEL = { OnTime: 'On time', NotSigned: 'Not signed' };
+  var PRIORITY_TONE = { Critical: 'red', High: 'amber', Normal: 'brand', Low: 'grey' };
+  var PAY_TONE = { Paid: 'green', Approved: 'blue', Draft: 'grey' };
+  var REVIEW_TONE = { Approved: 'green', Rejected: 'red', Pending: 'amber' };
+  var BUCKET_META = {
+    completed: { tone: 'green', label: 'Completed' },
+    pending: { tone: 'amber', label: 'Yet to validate' },
+    inProgress: { tone: 'blue', label: 'In progress' }
+  };
+
+  var UI = window.UI = {
+    esc: function (s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    },
+    num: function (n) { return Number(n || 0).toLocaleString('en-US'); },
+    money: function (n) {
+      var v = Math.round(Number(n || 0) * 100) / 100;
+      var s = v.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+      var c = App.state.config.currency || '';
+      if (!c) return s;
+      return /[A-Za-z]$/.test(c) ? c + ' ' + s : c + s;
+    },
+    pct: function (n) { return Math.round(Number(n || 0)) + '%'; },
+    initials: function (name) {
+      return String(name || '?').trim().split(/\s+/).slice(0, 2)
+        .map(function (w) { return w.charAt(0).toUpperCase(); }).join('') || '?';
+    },
+    avatar: function (o, cls) {
+      var name = o && (o.name || o.staffName) || '?';
+      var photo = o && o.photoUrl;
+      return '<span class="avatar ' + (cls || '') + '">' +
+        (photo ? '<img src="' + UI.esc(photo) + '" alt="">' : UI.esc(UI.initials(name))) +
+        '</span>';
+    },
+    pill: function (text, tone) {
+      return '<span class="pill ' + (tone || 'grey') + '">' + UI.esc(text) + '</span>';
+    },
+    taskPill: function (status) {
+      return UI.pill(TASK_LABEL[status] || status, TASK_TONE[status] || 'grey');
+    },
+    bucketPill: function (bucket) {
+      var m = BUCKET_META[bucket]; return m ? UI.pill(m.label, m.tone) : '';
+    },
+    staffPill: function (status) { return UI.pill(status, STAFF_TONE[status] || 'grey'); },
+    attPill: function (status) { return UI.pill(ATT_LABEL[status] || status, ATT_TONE[status] || 'grey'); },
+    priorityPill: function (p) { return UI.pill(p, PRIORITY_TONE[p] || 'grey'); },
+    payPill: function (s) { return UI.pill(s, PAY_TONE[s] || 'grey'); },
+    reviewPill: function (s) { return UI.pill(s, REVIEW_TONE[s] || 'grey'); },
+
+    progress: function (pct, tone) {
+      pct = Math.max(0, Math.min(100, Math.round(pct || 0)));
+      var t = tone || (pct >= 67 ? '' : pct >= 34 ? 'amber' : 'red');
+      return '<div class="prog ' + t + '"><i style="width:' + pct + '%"></i></div>';
+    },
+
+    empty: function (icon, title, sub) {
+      return '<div class="empty"><div class="e-ico">' + (icon || '∅') + '</div>' +
+        '<div class="e-title">' + UI.esc(title || 'Nothing here yet') + '</div>' +
+        (sub ? '<div class="small muted">' + UI.esc(sub) + '</div>' : '') + '</div>';
+    },
+
+    card: function (o) {
+      o = o || {};
+      return '<div class="card ' + (o.className || '') + '">' +
+        ((o.title || o.actions)
+          ? '<div class="card-head"><div><div class="card-title">' + UI.esc(o.title || '') +
+            '</div>' + (o.sub ? '<div class="card-sub">' + UI.esc(o.sub) + '</div>' : '') +
+            '</div>' + (o.actions ? '<div class="row-gap">' + o.actions + '</div>' : '') + '</div>'
+          : '') +
+        (o.body || '') + '</div>';
+    },
+
+    kpi: function (o) {
+      o = o || {};
+      return '<div class="kpi ' + (o.dark ? 'dark' : '') + '">' +
+        '<div class="k-top"><span class="k-label">' + UI.esc(o.label || '') + '</span>' +
+        (o.icon ? '<span class="k-ico">' + o.icon + '</span>' : '') + '</div>' +
+        '<div class="k-val">' + (o.value == null ? '—' : o.value) + '</div>' +
+        (o.foot ? '<div class="k-foot ' + (o.trend || '') + '">' + o.foot + '</div>' : '') +
+        '</div>';
+    },
+
+    /**
+     * Rounded bar chart. series = [{label, completed, total, earned}].
+     * Soft track sized to `total`, solid fill sized to `completed`.
+     */
+    barChart: function (series, o) {
+      o = o || {};
+      if (!series || !series.length) return UI.empty('▦', 'No activity in this period');
+      var max = Math.max.apply(null, series.map(function (s) { return s.total || 0; }).concat([1]));
+      var peak = -1, peakVal = -1;
+      series.forEach(function (s, i) { if ((s.completed || 0) > peakVal) { peakVal = s.completed; peak = i; } });
+
+      var bars = series.map(function (s, i) {
+        var h = Math.round((s.total || 0) / max * 100);
+        var fill = s.total ? Math.round((s.completed || 0) / s.total * 100) : 0;
+        var tip = s.completed + '/' + s.total + ' done' +
+          (o.money ? ' · ' + UI.money(s.earned) : '');
+        return '<div class="chart-col"><div class="chart-bar soft" style="height:' +
+          Math.max(h, 3) + '%;position:relative">' +
+          '<div class="chart-bar ' + (i === peak ? 'hatch' : '') +
+          '" style="position:absolute;left:0;right:0;bottom:0;height:' + fill + '%">' +
+          '<span class="tip">' + UI.esc(tip) + '</span></div></div></div>';
+      }).join('');
+
+      return '<div class="chart">' + bars + '</div>' +
+        '<div class="chart-x">' + series.map(function (s) {
+          return '<span>' + UI.esc(s.label) + '</span>';
+        }).join('') + '</div>' +
+        '<div class="legend"><span><i style="background:var(--bar-soft)"></i>Tasks due</span>' +
+        '<span><i style="background:var(--bar)"></i>Completed</span></div>';
+    },
+
+    /** SVG semicircle gauge from analytics.gauge. */
+    gauge: function (g) {
+      g = g || { total: 0, completed: 0, pending: 0, inProgress: 0, completedPct: 0 };
+      var cx = 100, cy = 100, r = 78, W = 200, H = 116;
+      function pt(f) { var a = Math.PI * (1 - f); return [cx + r * Math.cos(a), cy - r * Math.sin(a)]; }
+      function arc(f0, f1, color) {
+        if (f1 <= f0) return '';
+        var a = pt(f0), b = pt(f1), large = (f1 - f0) > 0.5 ? 1 : 0;
+        return '<path d="M' + a[0].toFixed(1) + ' ' + a[1].toFixed(1) + ' A' + r + ' ' + r +
+          ' 0 ' + large + ' 1 ' + b[0].toFixed(1) + ' ' + b[1].toFixed(1) +
+          '" fill="none" stroke="' + color + '" stroke-width="15" stroke-linecap="round"/>';
+      }
+      var total = g.total || 0;
+      var fc = total ? g.completed / total : 0;
+      var fi = total ? g.inProgress / total : 0;
+      var fp = total ? g.pending / total : 0;
+      var C = { done: '#0B2447', doing: '#3D6099', wait: '#B42318', track: '#E4E9F2' };
+      var seg = '';
+      if (total) {
+        var s0 = 0;
+        seg += arc(s0, s0 + fc, C.done); s0 += fc;
+        seg += arc(s0, s0 + fi, C.doing); s0 += fi;
+        seg += arc(s0, s0 + fp, C.wait);
+      }
+      return '<div class="gauge"><svg viewBox="0 0 ' + W + ' ' + H + '">' +
+        arc(0, 1, C.track) + seg + '</svg>' +
+        '<div class="gauge-center"><b>' + (g.completedPct || 0) + '%</b>' +
+        '<small>' + g.completed + ' of ' + total + ' completed</small></div></div>' +
+        '<div class="legend" style="justify-content:center">' +
+        '<span><i style="background:' + C.done + '"></i>Completed ' + g.completed + '</span>' +
+        '<span><i style="background:' + C.doing + '"></i>In progress ' + g.inProgress + '</span>' +
+        '<span><i style="background:' + C.wait + '"></i>Yet to validate ' + g.pending + '</span></div>';
+    },
+
+    /**
+     * Table. cols=[{key,label,className,align,render(row)}]. rows=[…].
+     * Each <tr> carries data-search built from cell text for global filtering.
+     */
+    table: function (o) {
+      o = o || {};
+      var cols = o.cols || [];
+      if (!o.rows || !o.rows.length) return UI.empty(o.emptyIcon || '▤', o.empty || 'Nothing to show');
+      var head = '<tr>' + cols.map(function (c) {
+        return '<th class="' + (c.align === 'right' ? 'right ' : '') + (c.className || '') + '">' +
+          UI.esc(c.label || '') + '</th>';
+      }).join('') + '</tr>';
+      var body = o.rows.map(function (row) {
+        var terms = [];
+        var cells = cols.map(function (c) {
+          var v = c.render ? c.render(row) : UI.esc(row[c.key] == null ? '' : row[c.key]);
+          if (c.search !== false) terms.push(String(c.render ? (row[c.key] || '') : (row[c.key] || '')));
+          return '<td class="' + (c.align === 'right' ? 'right ' : '') + (c.tdClass || '') + '">' +
+            v + '</td>';
+        }).join('');
+        if (o.searchFields) o.searchFields.forEach(function (f) { terms.push(String(row[f] || '')); });
+        return '<tr data-search="' + UI.esc(terms.join(' ')) + '">' + cells + '</tr>';
+      }).join('');
+      return '<div class="table-wrap"><table class="tbl"><thead>' + head +
+        '</thead><tbody>' + body + '</tbody></table></div>';
+    },
+
+    /** grid wrapper */
+    grid: function (cls, html) { return '<div class="grid ' + cls + '">' + html + '</div>'; }
+  };
+
+  /* =============================================================== launch */
+  wireShell();
+  App.boot().catch(function () { /* splash already shows the reason */ });
+})();
+</script>

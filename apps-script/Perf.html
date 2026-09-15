@@ -1,0 +1,301 @@
+<script>
+/* ==========================================================================
+   Perf.html — Performance utilities: caching, lazy-loading, pagination
+   Included BEFORE Scripts.html so window.Perf is available to the UI
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var Perf = window.Perf = {
+    cache: {},
+    db: null,
+    _dbReady: false,
+    _pendingRequests: {}  // Deduplication: {key -> Promise}
+  };
+
+  /* ======================================================================
+     IndexedDB Cache — persist frequently accessed data across sessions
+     ====================================================================== */
+
+  Perf.initDB = function () {
+    return new Promise(function (resolve, reject) {
+      if (Perf._dbReady) { resolve(Perf.db); return; }
+      var req = indexedDB.open('StaffMgmt', 1);
+      req.onerror = function () { reject(new Error('IndexedDB failed')); };
+      req.onsuccess = function () {
+        Perf.db = req.result;
+        Perf._dbReady = true;
+        resolve(Perf.db);
+      };
+      req.onupgradeneeded = function (e) {
+        var db = e.target.result;
+        if (!db.objectStoreNames.contains('cache')) {
+          db.createObjectStore('cache', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('meta')) {
+          db.createObjectStore('meta', { keyPath: 'key' });
+        }
+      };
+    });
+  };
+
+  /** Store data in IndexedDB + memory cache */
+  Perf.set = function (key, value, ttlMs) {
+    ttlMs = ttlMs || 600000; // 10 min default
+    var entry = { key: key, value: value, time: Date.now(), ttl: ttlMs };
+    Perf.cache[key] = entry;
+    if (Perf._dbReady) {
+      try {
+        var tx = Perf.db.transaction(['cache'], 'readwrite');
+        tx.objectStore('cache').put(entry);
+      } catch (e) {}
+    }
+  };
+
+  /** Get data from memory cache or IndexedDB */
+  Perf.get = function (key) {
+    var entry = Perf.cache[key];
+    if (entry && (Date.now() - entry.time < entry.ttl)) {
+      return Promise.resolve(entry.value);
+    }
+    // Not in memory; try IndexedDB
+    if (!Perf._dbReady) return Promise.resolve(null);
+    return new Promise(function (resolve) {
+      try {
+        var tx = Perf.db.transaction(['cache'], 'readonly');
+        var req = tx.objectStore('cache').get(key);
+        req.onsuccess = function () {
+          var e = req.result;
+          if (e && (Date.now() - e.time < e.ttl)) {
+            Perf.cache[key] = e; // Restore to memory
+            resolve(e.value);
+          } else {
+            resolve(null);
+          }
+        };
+        req.onerror = function () { resolve(null); };
+      } catch (e) { resolve(null); }
+    });
+  };
+
+  Perf.clear = function (key) {
+    delete Perf.cache[key];
+    if (Perf._dbReady) {
+      try {
+        var tx = Perf.db.transaction(['cache'], 'readwrite');
+        tx.objectStore('cache').delete(key);
+      } catch (e) {}
+    }
+  };
+
+  Perf.clearAll = function () {
+    Perf.cache = {};
+    if (Perf._dbReady) {
+      try {
+        var tx = Perf.db.transaction(['cache'], 'readwrite');
+        tx.objectStore('cache').clear();
+      } catch (e) {}
+    }
+  };
+
+  /* ======================================================================
+     Request Deduplication — avoid multiple identical API calls
+     ====================================================================== */
+
+  Perf.dedupedApi = function (method, payload) {
+    var key = method + ':' + JSON.stringify(payload || {});
+    if (Perf._pendingRequests[key]) {
+      return Perf._pendingRequests[key]; // Return existing promise
+    }
+    var promise = App.api(method, payload).then(function (data) {
+      delete Perf._pendingRequests[key];
+      // Cache the result for 5min
+      Perf.set(method + '_result', data, 300000);
+      return data;
+    }).catch(function (err) {
+      delete Perf._pendingRequests[key];
+      throw err;
+    });
+    Perf._pendingRequests[key] = promise;
+    return promise;
+  };
+
+  /* ======================================================================
+     Table Pagination — lazy-load table data instead of rendering all at once
+     ====================================================================== */
+
+  Perf.paginatedTable = function (opts) {
+    opts = opts || {};
+    var pageSize = opts.pageSize || 50;
+    var rows = opts.rows || [];
+    var cols = opts.cols || [];
+    var searchFields = opts.searchFields || [];
+
+    if (rows.length <= pageSize) {
+      // Small dataset — render normally
+      return UI.table({ cols: cols, rows: rows, empty: opts.empty, searchFields: searchFields });
+    }
+
+    // Large dataset — paginate
+    var html = '<div id="paginatedTable" data-page="0" data-pagesize="' + pageSize + '">';
+    var displayRows = rows.slice(0, pageSize);
+
+    html += UI.table({ cols: cols, rows: displayRows, empty: opts.empty, searchFields: searchFields });
+
+    // Load more button
+    if (rows.length > pageSize) {
+      html += '</div><div style="text-align:center;margin-top:14px;padding:14px;border-top:1px solid var(--line)">' +
+        '<button class="btn outline" data-perf="loadMore" data-remaining="' + (rows.length - pageSize) + '">' +
+        'Load ' + Math.min(pageSize, rows.length - pageSize) + ' more (' + (rows.length - pageSize) + ' left)</button>' +
+        '</div><div id="paginatedTableMore"></div>';
+    } else {
+      html += '</div>';
+    }
+
+    // Lazy-load handler will be wired by caller
+    Perf._paginatedTableData = {
+      rows: rows,
+      cols: cols,
+      pageSize: pageSize,
+      searchFields: searchFields
+    };
+
+    return html;
+  };
+
+  /** Wire up lazy-load handler after rendering */
+  Perf.wirePaginatedTable = function (mount) {
+    if (!mount) return;
+    var btn = mount.querySelector('[data-perf="loadMore"]');
+    if (!btn) return;
+    if (btn.__perfBound) return;
+
+    var tableHost = mount.querySelector('#paginatedTable');
+    var moreHost = mount.querySelector('#paginatedTableMore');
+    if (!tableHost || !moreHost) return;
+
+    var data = Perf._paginatedTableData;
+    if (!data) return;
+
+    btn.__perfBound = true;
+    btn.addEventListener('click', function () {
+      btn.disabled = true;
+      var currentPage = parseInt(tableHost.getAttribute('data-page') || '0', 10);
+      var pageSize = parseInt(tableHost.getAttribute('data-pagesize') || '50', 10);
+      var startIdx = (currentPage + 1) * pageSize;
+      var endIdx = Math.min(startIdx + pageSize, data.rows.length);
+      var newRows = data.rows.slice(startIdx, endIdx);
+
+      if (newRows.length) {
+        var newTable = UI.table({ cols: data.cols, rows: newRows, searchFields: data.searchFields });
+        moreHost.innerHTML += newTable;
+        tableHost.setAttribute('data-page', String(currentPage + 1));
+
+        var remaining = data.rows.length - endIdx;
+        if (remaining > 0) {
+          btn.textContent = 'Load ' + Math.min(pageSize, remaining) + ' more (' + remaining + ' left)';
+          btn.disabled = false;
+        } else {
+          btn.remove();
+        }
+      }
+    });
+  };
+
+  /* ======================================================================
+     Image Lazy-Loading — defer offscreen images
+     ====================================================================== */
+
+  Perf.lazyLoadImages = function (container) {
+    if (!('IntersectionObserver' in window)) return; // Fallback: load immediately
+    var images = container.querySelectorAll('img[data-lazy]');
+    if (!images.length) return;
+
+    var observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          var img = entry.target;
+          if (img.getAttribute('data-src')) {
+            img.src = img.getAttribute('data-src');
+            img.removeAttribute('data-lazy');
+            img.removeAttribute('data-src');
+          }
+          observer.unobserve(img);
+        }
+      });
+    }, { rootMargin: '50px' });
+
+    images.forEach(function (img) { observer.observe(img); });
+  };
+
+  /* ======================================================================
+     Table Rendering with Lazy-Load Support
+     ====================================================================== */
+
+  Perf.renderTableWithImages = function (cols, rows, opts) {
+    opts = opts || {};
+    var html = '<table class="data-table">' +
+      '<thead><tr>' +
+      cols.map(function (c) {
+        return '<th' + (c.align ? ' style="text-align:' + c.align + '"' : '') + '>' + 
+          (c.label || '') + '</th>';
+      }).join('') +
+      '</tr></thead><tbody>';
+
+    rows.forEach(function (row) {
+      html += '<tr>';
+      cols.forEach(function (col) {
+        var content = col.render ? col.render(row) : '';
+        // If content has <img>, add lazy-load attributes
+        if (content.indexOf('<img') !== -1) {
+          content = content.replace(/<img\s+src="([^"]*)"/g, '<img data-lazy data-src="$1" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"');
+        }
+        html += '<td' + (col.align ? ' style="text-align:' + col.align + '"' : '') + '>' + 
+          content + '</td>';
+      });
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    return html;
+  };
+
+  /* ======================================================================
+     Prefetch Next Page on Scroll
+     ====================================================================== */
+
+  Perf.prefetchOnScroll = function (mount, fetchFn) {
+    if (!('IntersectionObserver' in window)) return;
+    var sentinel = document.createElement('div');
+    sentinel.id = 'prefetchSentinel';
+    mount.appendChild(sentinel);
+
+    var observer = new IntersectionObserver(function (entries) {
+      if (entries[0].isIntersecting) {
+        fetchFn();
+      }
+    }, { threshold: 0.1 });
+    observer.observe(sentinel);
+  };
+
+  /* ======================================================================
+     Performance Stats — log metrics for debugging
+     ====================================================================== */
+
+  Perf.mark = function (name) {
+    if (window.performance && window.performance.mark) {
+      window.performance.mark(name);
+    }
+  };
+
+  Perf.measure = function (name, start, end) {
+    if (window.performance && window.performance.measure) {
+      try {
+        window.performance.measure(name, start, end);
+        var measure = window.performance.getEntriesByName(name)[0];
+        console.log('[PERF]', name + ':', measure.duration.toFixed(2) + 'ms');
+      } catch (e) {}
+    }
+  };
+
+})();
+</script>
