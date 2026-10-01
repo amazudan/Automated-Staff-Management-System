@@ -340,13 +340,22 @@ var TaskService = {
     var fromStaff = task.AssignedTo, fromDue = task.DueDate;
     var wasFailed = String(task.Status) === TASK_STATUS.FAILED ||
                     String(task.Status) === TASK_STATUS.COMPLETED;
-    var reactivate = opts.reactivate === undefined ? wasFailed : !!opts.reactivate;
+    // A follow-up (requirement 1) re-opens the same work — usually for the same
+    // person — under a "Follow-up:" heading, with no penalty. It always
+    // reactivates so the task re-appears on the owner's board.
+    var followUp = !!opts.followUp;
+    var reactivate = followUp ? true
+      : (opts.reactivate === undefined ? wasFailed : !!opts.reactivate);
 
     var changes = {
       AssignedTo: String(staff.StaffID),
       AssignedToName: String(staff.Name),
       LastUpdated: new Date()
     };
+    if (followUp) {
+      var baseTitle = String(task.Title || '');
+      changes.Title = /^\s*Follow-up:/i.test(baseTitle) ? baseTitle : 'Follow-up: ' + baseTitle;
+    }
 
     if (reactivate) {
       // A failed / finished task handed to someone new starts fresh for them.
@@ -376,10 +385,12 @@ var TaskService = {
     ]);
 
     var newDue = changes.DueDate || task.DueDate;
-    NotificationService.push(staff.StaffID, 'TaskAssigned', 'info',
-      'Task assigned to you: ' + task.Title,
+    var noticeTitle = followUp ? 'Follow-up task: ' + task.Title
+                               : 'Task assigned to you: ' + task.Title;
+    NotificationService.push(staff.StaffID, 'TaskAssigned', 'info', noticeTitle,
       'Due ' + Util.fmtDate(newDue) + '.' +
-      (wasFailed ? ' Reactivated from a failed task — please acknowledge and retry.' : ''));
+      (followUp ? ' A follow-up on your earlier work — no penalty applies.'
+                : (wasFailed ? ' Reactivated from a failed task — please acknowledge and retry.' : '')));
     var merged = {};
     Object.keys(task).forEach(function (k) { merged[k] = task[k]; });
     Object.keys(changes).forEach(function (k) { merged[k] = changes[k]; });
@@ -393,7 +404,8 @@ var TaskService = {
       assignedTo: changes.AssignedTo,
       assignedToName: changes.AssignedToName,
       status: changes.Status || String(task.Status),
-      reactivated: reactivate
+      reactivated: reactivate,
+      followUp: followUp
     };
   },
 
@@ -591,12 +603,17 @@ var TaskService = {
     };
   },
 
-  /** Send a submission back without accepting any progress. */
+  /**
+   * Send a submission back without accepting any progress. Per requirement 4 a
+   * rejected task returns to the "Assigned" state — the staff member must
+   * acknowledge and rework it — so acknowledgement is cleared too.
+   */
   reject: function (taskId, admin, comment) {
     var task = this.byId(taskId);
     if (!task) throw new Error('Task not found.');
     SheetDB.updateRowAt(SHEETS.TASKS, task.__row, {
-      Status: TASK_STATUS.IN_PROGRESS,
+      Status: TASK_STATUS.ASSIGNED,
+      AcknowledgedAt: '',
       ValidatedProgress: 0,
       PayableAmount: 0,
       IsPriority: true,
@@ -605,8 +622,11 @@ var TaskService = {
       ValidatedBy: String(admin.Email || admin.StaffID),
       LastUpdated: new Date()
     });
+    // Zeroing validated progress releases this task's share back to the month.
+    AllocationService.recalcStaffMonth(task.AssignedTo, task.DueDate);
     NotificationService.push(task.AssignedTo, 'TaskRejected', 'danger',
-      'Rework needed: ' + task.Title, String(comment || 'Returned for rework.'));
+      'Rework needed: ' + task.Title,
+      String(comment || 'Returned for rework.') + ' Acknowledge it again to restart.');
     var staff = StaffService.byId(task.AssignedTo);
     if (staff) {
       try { Notify.taskRejected(staff, task, comment); }
@@ -614,6 +634,168 @@ var TaskService = {
     }
     Log.info('Tasks', 'Rejected ' + taskId + ' by ' + admin.Email);
     return true;
+  },
+
+  /* --- Reverse, escalate & resolve (requirements 3 & 4) ----------------- */
+
+  /**
+   * Reverse an approved (Completed) task back to the "pending validation"
+   * state so it can be validated again — requirement 4. Progress and pay are
+   * reset to zero until it is re-validated.
+   */
+  reverse: function (taskId, admin, comment) {
+    var task = this.byId(taskId);
+    if (!task) throw new Error('Task not found.');
+    if (String(task.Status) !== TASK_STATUS.COMPLETED) {
+      throw new Error('Only an approved (completed) task can be reversed.');
+    }
+    SheetDB.updateRowAt(SHEETS.TASKS, task.__row, {
+      Status: TASK_STATUS.PENDING_VALIDATION,
+      ValidatedProgress: 0,
+      PayableAmount: 0,
+      CompletedAt: '',
+      ValidatedAt: '',
+      ValidatedBy: '',
+      AdminComment: String(comment || 'Approval reversed — awaiting re-validation.'),
+      LastUpdated: new Date()
+    });
+    // Releasing the validated progress hands this task's share back to the month.
+    AllocationService.recalcStaffMonth(task.AssignedTo, task.DueDate);
+    NotificationService.push(task.AssignedTo, 'TaskReversed', 'warn',
+      'Approval reversed: ' + task.Title,
+      String(comment || 'Your completed task is awaiting re-validation.'));
+    Log.info('Tasks', 'Reversed ' + taskId + ' by ' + admin.Email);
+    return { status: TASK_STATUS.PENDING_VALIDATION, taskId: String(task.TaskID) };
+  },
+
+  /**
+   * Escalate a task to a Software Developer — requirement 3. The task stays
+   * assigned to the original staff member (pay attribution is unchanged) but is
+   * flagged as escalated; the developer is emailed immediately, then works AND
+   * validates it. The original assignee sees "Resolved" once it is done.
+   */
+  escalate: function (taskId, actor, developerId, note) {
+    var task = this.byId(taskId);
+    if (!task) throw new Error('Task not found.');
+    if (String(task.Status) === TASK_STATUS.CANCELLED) {
+      throw new Error('A cancelled task cannot be escalated.');
+    }
+    if (String(task.EscalationStatus) === 'Open') {
+      throw new Error('This task is already escalated to ' +
+        (task.EscalatedToName || 'a developer') + '.');
+    }
+    var dev = StaffService.byId(developerId);
+    if (!dev) throw new Error('Choose a developer to escalate to.');
+    if (!Auth.isDeveloper(dev.Role)) {
+      throw new Error(dev.Name + ' is not a Software Developer.');
+    }
+    if (String(dev.Status) === STAFF_STATUS.INACTIVE) {
+      throw new Error(dev.Name + ' is inactive.');
+    }
+    if (String(dev.StaffID) === String(task.AssignedTo)) {
+      throw new Error('A task cannot be escalated to its own assignee.');
+    }
+
+    SheetDB.updateRowAt(SHEETS.TASKS, task.__row, {
+      EscalatedTo: String(dev.StaffID),
+      EscalatedToName: String(dev.Name),
+      EscalatedBy: String(actor.Email || actor.StaffID || actor),
+      EscalatedAt: new Date(),
+      EscalationStatus: 'Open',
+      IsPriority: true,
+      LastUpdated: new Date()
+    });
+
+    var fromStaff = StaffService.byId(task.AssignedTo);
+    var fromName = fromStaff ? fromStaff.Name : task.AssignedToName;
+    NotificationService.push(dev.StaffID, 'TaskEscalated', 'danger',
+      'Escalated to you: ' + task.Title,
+      'From ' + fromName + '. Work on it now, then validate to resolve it.' +
+      (note ? ' Note: ' + note : ''));
+    try { Notify.taskEscalated(dev, task, fromStaff, note); }
+    catch (e) { Log.exception('Tasks.escalate/notify', e); }
+    if (fromStaff) {
+      NotificationService.push(fromStaff.StaffID, 'TaskEscalated', 'info',
+        'Escalated for you: ' + task.Title,
+        'Handed to ' + dev.Name + ' to resolve. You will be notified when it is done.');
+    }
+
+    Log.info('Tasks', 'Escalated ' + taskId + ' to developer ' + dev.StaffID +
+      ' by ' + (actor.Email || actor));
+    return {
+      taskId: String(task.TaskID),
+      escalatedTo: String(dev.StaffID),
+      escalatedToName: String(dev.Name),
+      escalationStatus: 'Open'
+    };
+  },
+
+  /** Tasks currently escalated to — and still open for — a given developer. */
+  forDeveloper: function (developerId) {
+    return SheetDB.find(SHEETS.TASKS, function (t) {
+      return String(t.EscalatedTo) === String(developerId) &&
+             String(t.EscalationStatus) === 'Open';
+    });
+  },
+
+  /**
+   * The developer it was escalated to (or management) resolves the task —
+   * requirement 3. It becomes Completed with EscalationStatus='Resolved'; the
+   * original assignee sees "Resolved" and keeps the pay attribution.
+   */
+  resolveEscalation: function (taskId, actor, payload) {
+    payload = payload || {};
+    var task = this.byId(taskId);
+    if (!task) throw new Error('Task not found.');
+    if (String(task.EscalationStatus) !== 'Open') {
+      throw new Error('This task has no open escalation.');
+    }
+    var isAssignedDev = String(task.EscalatedTo) === String(actor.StaffID);
+    if (!isAssignedDev && !Auth.isManagement(actor.Role)) {
+      throw new Error('Only the developer it was escalated to, or management, can resolve it.');
+    }
+
+    var validated = Util.pct(
+      payload.validatedProgress === undefined || payload.validatedProgress === ''
+        ? 100 : payload.validatedProgress);
+
+    var changes = {
+      Status: TASK_STATUS.COMPLETED,
+      CompletedAt: new Date(),
+      ValidatedProgress: validated,
+      ValidatedAt: new Date(),
+      ValidatedBy: String(actor.Email || actor.StaffID),
+      EscalationStatus: 'Resolved',
+      ResolvedAt: new Date(),
+      AdminComment: payload.comment === undefined ? task.AdminComment : String(payload.comment),
+      IsPriority: false,
+      LastUpdated: new Date()
+    };
+    var merged = {};
+    Object.keys(task).forEach(function (k) { merged[k] = task[k]; });
+    Object.keys(changes).forEach(function (k) { merged[k] = changes[k]; });
+    changes.PayableAmount = this.payableAmount(merged);
+    changes.MetricScore = this.computeMetricScore(merged);
+
+    SheetDB.updateRowAt(SHEETS.TASKS, task.__row, changes);
+    // Validated progress now counts — re-split the month so pay reflects it.
+    AllocationService.recalcStaffMonth(task.AssignedTo, task.DueDate);
+
+    var staff = StaffService.byId(task.AssignedTo);
+    if (staff) {
+      NotificationService.push(staff.StaffID, 'TaskResolved', 'success',
+        'Resolved: ' + task.Title,
+        'Your escalated task has been resolved by ' + (actor.Name || 'a developer') + '.');
+      try { Notify.escalationResolved(staff, task, actor); }
+      catch (e) { Log.exception('Tasks.resolveEscalation/notify', e); }
+    }
+    Log.info('Tasks', 'Resolved escalation ' + taskId + ' by ' + (actor.Email || actor.StaffID));
+    return {
+      status: TASK_STATUS.COMPLETED,
+      escalationStatus: 'Resolved',
+      taskId: String(task.TaskID),
+      payableAmount: changes.PayableAmount
+    };
   },
 
   /* --- Automation ------------------------------------------------------- */

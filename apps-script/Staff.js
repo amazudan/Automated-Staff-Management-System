@@ -61,8 +61,10 @@ var StaffService = {
 
     if (!name) throw new Error('Staff name is required.');
     if (!Util.isEmail(email)) throw new Error('"' + input.email + '" is not a valid email address.');
-    if ([ROLES.ADMIN, ROLES.MANAGER, ROLES.STAFF].indexOf(role) === -1) {
-      throw new Error('Role must be Admin, Manager or Staff.');
+    var knownRoles = [ROLES.MANAGEMENT, ROLES.OPERATIONS, ROLES.DEVELOPER,
+                      ROLES.STAFF, ROLES.ADMIN, ROLES.MANAGER];
+    if (knownRoles.indexOf(role) === -1) {
+      throw new Error('Role must be one of: ' + ASSIGNABLE_ROLES.join(', ') + '.');
     }
     if (Auth.staffByEmail(email)) {
       throw new Error('A staff record already exists for ' + email + '.');
@@ -72,6 +74,10 @@ var StaffService = {
       ? Util.money(CFG.num('DefaultMonthlySalary', 0))
       : Util.money(input.monthlySalary);
     if (salary < 0) throw new Error('The guaranteed monthly salary cannot be negative.');
+
+    var accessLevel = String(input.accessLevel || 'Full').trim();
+    if (['Full', 'Restricted'].indexOf(accessLevel) === -1) accessLevel = 'Full';
+    var canAssignTasks = Util.truthy(input.canAssignTasks);
 
     var record = {
       StaffID: SheetDB.nextId('STF', SHEETS.STAFF, 'StaffID', 4),
@@ -93,6 +99,8 @@ var StaffService = {
       LastLogin: '',
       PhotoUrl: String(input.photoUrl || '').trim(),
       Notes: String(input.notes || '').trim(),
+      AccessLevel: accessLevel,
+      CanAssignTasks: canAssignTasks,
       // Guaranteed monthly salary. Task allocations are derived from it, so it
       // is the only money figure anybody has to type in.
       MonthlySalary: salary
@@ -129,16 +137,26 @@ var StaffService = {
       changes.Email = email;
     }
     if (patch.role !== undefined) {
-      if ([ROLES.ADMIN, ROLES.MANAGER, ROLES.STAFF].indexOf(String(patch.role)) === -1) {
-        throw new Error('Role must be Admin, Manager or Staff.');
+      var newRole = String(patch.role);
+      if ([ROLES.MANAGEMENT, ROLES.OPERATIONS, ROLES.DEVELOPER,
+           ROLES.STAFF, ROLES.ADMIN, ROLES.MANAGER].indexOf(newRole) === -1) {
+        throw new Error('Role must be one of: ' + ASSIGNABLE_ROLES.join(', ') + '.');
       }
-      changes.Role = String(patch.role);
+      changes.Role = newRole;
     }
-    ['phone:Phone', 'department:Department', 'position:Position',
+       ['phone:Phone', 'department:Department', 'position:Position',
      'photoUrl:PhotoUrl', 'notes:Notes'].forEach(function (pair) {
       var parts = pair.split(':');
       if (patch[parts[0]] !== undefined) changes[parts[1]] = String(patch[parts[0]]).trim();
     });
+    if (patch.accessLevel !== undefined) {
+      var al = String(patch.accessLevel).trim();
+      if (['Full', 'Restricted'].indexOf(al) === -1) throw new Error('Access level must be Full or Restricted.');
+      changes.AccessLevel = al;
+    }
+    if (patch.canAssignTasks !== undefined) {
+      changes.CanAssignTasks = Util.truthy(patch.canAssignTasks);
+    }
     if (patch.monthlySalary !== undefined && patch.monthlySalary !== '') {
       var salary = Util.money(patch.monthlySalary);
       if (salary < 0) throw new Error('The guaranteed monthly salary cannot be negative.');

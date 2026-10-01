@@ -49,9 +49,50 @@ var Auth = (function () {
     });
   }
 
+  /** Normalise a role string for comparison. */
+  function roleOf(role) { return String(role || '').trim(); }
+
+  /** Management tier — the general overseer. Legacy 'Admin' maps here. */
+  function isManagement(role) {
+    var r = roleOf(role);
+    return r === ROLES.MANAGEMENT || r === ROLES.ADMIN;
+  }
+
+  /** Operations tier — administrator duties without payroll. Legacy 'Manager' maps here. */
+  function isOperations(role) {
+    var r = roleOf(role);
+    return r === ROLES.OPERATIONS || r === ROLES.MANAGER;
+  }
+
+  /** Software Developer — receives escalated tasks and validates them. */
+  function isDeveloper(role) {
+    return roleOf(role) === ROLES.DEVELOPER;
+  }
+
+  /**
+   * "Admin console" access: management and operations both run the admin
+   * dashboard (assign/validate tasks, strikes, attendance). Legacy Admin and
+   * Manager are included so existing rows keep working.
+   */
   function isAdminRole(role) {
-    var r = String(role || '').trim();
-    return r === ROLES.ADMIN || r === ROLES.MANAGER;
+    return isManagement(role) || isOperations(role);
+  }
+
+  /** Only management sees and runs payroll. */
+  function canAccessPayroll(role) { return isManagement(role); }
+
+  /** Management has no attendance obligation and is skipped by the sweep. */
+  function isAttendanceExempt(role) { return isManagement(role); }
+
+  /**
+   * Can an actor with actorRole set a staff member's role to targetRole?
+   * Only management may grant the Management role; operations may set the other
+   * roles (Operations / Software Developer / Staff).
+   */
+  function canGrantRole(actorRole, targetRole) {
+    var t = roleOf(targetRole);
+    if (t === ROLES.MANAGEMENT || t === ROLES.ADMIN) return isManagement(actorRole);
+    return isAdminRole(actorRole);
   }
 
   /** Trim a Staff row down to what the browser is allowed to see. */
@@ -64,6 +105,10 @@ var Auth = (function () {
       phone: String(staff.Phone || ''),
       role: String(staff.Role),
       isAdmin: isAdminRole(staff.Role),
+      isManagement: isManagement(staff.Role),
+      isOperations: isOperations(staff.Role),
+      isDeveloper: isDeveloper(staff.Role),
+      canAccessPayroll: canAccessPayroll(staff.Role),
       department: String(staff.Department || ''),
       position: String(staff.Position || ''),
       status: String(staff.Status),
@@ -74,6 +119,8 @@ var Auth = (function () {
       totalStrikesIssued: Util.num(staff.TotalStrikesIssued, 0),
       photoUrl: String(staff.PhotoUrl || ''),
       dateAdded: Util.dateKey(staff.DateAdded),
+      accessLevel: String(staff.AccessLevel || 'Full'),
+      canAssignTasks: isAdminRole(staff.Role) || Util.truthy(staff.CanAssignTasks),
       // Their own guaranteed monthly salary — the basis of every task allocation.
       monthlySalary: AllocationService.salaryOf(staff)
     };
@@ -111,6 +158,12 @@ var Auth = (function () {
     staffByEmail: staffByEmail,
     staffByToken: staffByToken,
     isAdminRole: isAdminRole,
+    isManagement: isManagement,
+    isOperations: isOperations,
+    isDeveloper: isDeveloper,
+    isAttendanceExempt: isAttendanceExempt,
+    canAccessPayroll: canAccessPayroll,
+    canGrantRole: canGrantRole,
     publicProfile: publicProfile,
 
     /**
@@ -178,6 +231,25 @@ var Auth = (function () {
     requireAdmin: function (token) {
       var staff = this.requireStaff(token);
       if (!isAdminRole(staff.Role)) throw new Error('FORBIDDEN: administrator access required.');
+      return staff;
+    },
+
+    /** Throw unless the caller is management (payroll + full organisation control). */
+    requireManagement: function (token) {
+      var staff = this.requireStaff(token);
+      if (!isManagement(staff.Role)) throw new Error('FORBIDDEN: management access required.');
+      return staff;
+    },
+
+    /** True for admins/managers, or any staff member flagged CanAssignTasks. */
+    canAssignTasks: function (staff) {
+      return isAdminRole(staff.Role) || Util.truthy(staff.CanAssignTasks);
+    },
+
+    /** Throw unless the caller may create/assign tasks (admin or delegated staff). */
+    requireTaskManager: function (token) {
+      var staff = this.requireStaff(token);
+      if (!this.canAssignTasks(staff)) throw new Error('FORBIDDEN: task assignment access required.');
       return staff;
     },
 

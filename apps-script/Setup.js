@@ -223,3 +223,17 @@ function onOpen() {
       .addToUi();
   } catch (e) { /* not container-bound */ }
 }
+function setupCanAssignTasks() {
+  var staffSheet = SheetDB.spreadsheet().getSheetByName(SHEETS.STAFF);
+  var lastCol = staffSheet.getLastColumn();
+  var headers = staffSheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h).trim(); });
+  if (headers.indexOf('CanAssignTasks') === -1) {
+    staffSheet.getRange(1, lastCol + 1).setValue('CanAssignTasks');
+    var lastRow = staffSheet.getLastRow();
+    if (lastRow > 1) {
+      var vals = []; for (var i = 0; i < lastRow - 1; i++) vals.push([false]);
+      staffSheet.getRange(2, lastCol + 1, vals.length, 1).setValues(vals);
+    }
+    Logger.log('CanAssignTasks column added, defaulted to FALSE.');
+  }
+}

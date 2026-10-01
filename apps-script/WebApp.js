@@ -20,13 +20,23 @@
  * ------------------------------------------------------------------------- */
 
 function doGet(e) {
-  var page = (e && e.parameter && e.parameter.page) || 'app';
+  var params = (e && e.parameter) || {};
+  var page = String(params.page || '').toLowerCase();
+  // Support a bare ?admin / ?management as shorthand for ?page=admin so a
+  // simple "…/exec?admin" link opens the management entrance too.
+  if (!page && (params.admin !== undefined || params.management !== undefined)) page = 'admin';
+  if (page === 'management') page = 'admin';
+  if (page !== 'admin') page = 'app';
+  var company = CFG.get('CompanyName', 'Staff Management');
   var tpl = HtmlService.createTemplateFromFile('Index');
   tpl.bootPage = page;
-  tpl.companyName = CFG.get('CompanyName', 'Staff Management');
+  tpl.companyName = company;
   tpl.companyLogoUrl = String(CFG.get('CompanyLogoUrl', '')).trim();
+  // Absolute /exec URL so the client can build cross-door links (already used
+  // by Notifications; no extra OAuth scope).
+  try { tpl.scriptUrl = ScriptApp.getService().getUrl() || ''; } catch (err) { tpl.scriptUrl = ''; }
   return tpl.evaluate()
-    .setTitle(CFG.get('CompanyName', 'Staff Management') + ' — Workspace')
+    .setTitle(company + (page === 'admin' ? ' — Management' : ' — Workspace'))
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
@@ -47,7 +57,10 @@ function include(filename) {
  */
 function withApi_(o, body) {
   try {
-    var staff = o.admin ? Auth.requireAdmin(o.token) : Auth.requireStaff(o.token);
+    var staff = o.management ? Auth.requireManagement(o.token)
+  : o.admin ? Auth.requireAdmin(o.token)
+  : o.taskManager ? Auth.requireTaskManager(o.token)
+  : Auth.requireStaff(o.token);
     var run = function () { return body(staff); };
     var data = o.write ? SheetDB.withLock(run, 25000) : run();
     return { ok: true, data: data };
@@ -113,7 +126,19 @@ function mapTask_(t) {
     completedAt: Util.dateKey(t.CompletedAt),
     overdue: open && dueKey !== '' && dueKey < todayKey,
     dueToday: dueKey === todayKey,
-    reportedToday: DailyReportService.existsFor(t.TaskID, todayKey)
+    reportedToday: DailyReportService.existsFor(t.TaskID, todayKey),
+    // Escalation (requirement 3) — the task stays assigned to its owner; these
+    // fields describe the developer it was handed to and whether it is resolved.
+    escalatedTo: String(t.EscalatedTo || ''),
+    escalatedToName: String(t.EscalatedToName ||
+      (t.EscalatedTo ? StaffService.name(t.EscalatedTo) : '')),
+    escalatedBy: String(t.EscalatedBy || ''),
+    escalatedAt: Util.fmtDateTime(t.EscalatedAt),
+    escalationStatus: String(t.EscalationStatus || ''),
+    escalated: String(t.EscalationStatus || '') === 'Open',
+    resolved: String(t.EscalationStatus || '') === 'Resolved',
+    resolvedAt: Util.dateKey(t.ResolvedAt),
+    isFollowUp: /^\s*Follow-up:/i.test(String(t.Title || ''))
   };
 }
 
@@ -184,9 +209,15 @@ function mapStaffRow_(s) {
     dateAdded: Util.dateKey(s.DateAdded),
     photoUrl: String(s.PhotoUrl || ''),
     notes: String(s.Notes || ''),
-    monthlySalary: AllocationService.salaryOf(s),
+        monthlySalary: AllocationService.salaryOf(s),
     tasks: board,
-    hasPin: !!s.PinHash
+    hasPin: !!s.PinHash,
+    accessLevel: String(s.AccessLevel || 'Full'),
+    canAssignTasks: Auth.isAdminRole(s.Role) || Util.truthy(s.CanAssignTasks),
+    isManagement: Auth.isManagement(s.Role),
+    isOperations: Auth.isOperations(s.Role),
+    isDeveloper: Auth.isDeveloper(s.Role),
+    canAccessPayroll: Auth.canAccessPayroll(s.Role)
   };
 }
 
@@ -214,7 +245,9 @@ function clientConfig_() {
     statuses: TASK_STATUS,
     uploadCategories: UploadService.CATEGORIES,
     uploadVisibilities: UploadService.VISIBILITIES,
-    today: Util.dateKey(Util.today())
+    today: Util.dateKey(Util.today()),
+    roles: ASSIGNABLE_ROLES,
+    escalationTargetRole: ROLES.DEVELOPER
   };
 }
 
@@ -373,7 +406,31 @@ function api_adminDashboard(token, opts) {
       staffStats: StaffService.stats(),
       performance: performance,
       attendanceToday: AttendanceService.todayBoard(),
-      payroll: PayrollService.organisationSummary(period.type, period.start),
+      // Every role except management signs attendance, and operations run the
+      // admin dashboard — so hand the caller their own clock-in state here.
+      // Management is exempt (exempt:true) and the client shows no card for it.
+      myAttendance: {
+        exempt: Auth.isAttendanceExempt(admin.Role),
+        today: (function () {
+          var r = AttendanceService.recordFor(admin.StaffID, Util.dateKey(Util.today()));
+          return r ? {
+            status: String(r.Status),
+            loginTime: Util.fmtTime(r.LoginTime),
+            logoutTime: Util.fmtTime(r.LogoutTime),
+            minutesLate: Util.num(r.MinutesLate, 0)
+          } : null;
+        })(),
+        signedIn: AttendanceService.hasSignedInToday(admin.StaffID),
+        stats: (function () {
+          var a = AttendanceService.statsFor(admin.StaffID, period);
+          delete a.records;
+          return a;
+        })()
+      },
+      // Requirement 3 — only management sees payroll figures; operations run
+      // the rest of the admin dashboard without pay data.
+      payroll: Auth.isManagement(admin.Role)
+        ? PayrollService.organisationSummary(period.type, period.start) : null,
       strikes: StrikeService.all().map(mapStrike_).sort(function (a, b) {
         return String(b.date).localeCompare(String(a.date));
       }).slice(0, 25),
@@ -427,6 +484,8 @@ function api_staffDashboard(token, opts) {
                 start: period.startKey, end: period.endKey },
       board: TaskService.board(staff.StaffID),
       buckets: buckets,
+      // Requirement 3 — tasks handed to this person (a developer) to resolve.
+      escalatedToMe: TaskService.forDeveloper(staff.StaffID).map(mapTask_),
       tasksNeedingReportToday: buckets.inProgress.filter(function (t) {
         return !t.reportedToday;
       }),
@@ -577,7 +636,7 @@ function api_staffList(token) {
  * a task to). Deliberately cheap — no task boards, no strike maths.
  */
 function api_staffDirectory(token) {
-  return withApi_({ token: token, admin: true, name: 'staffDirectory' }, function () {
+  return withApi_({ token: token, taskManager: true, name: 'staffDirectory' }, function () {
     return StaffService.all().filter(function (s) {
       return String(s.Status) !== STAFF_STATUS.INACTIVE;
     }).map(function (s) {
@@ -596,7 +655,12 @@ function api_staffDirectory(token) {
 function api_staffCreate(token, payload) {
   return withApi_({ token: token, admin: true, name: 'staffCreate', write: true },
     function (admin) {
-      return StaffService.create(payload || {}, admin.Email);
+      payload = payload || {};
+      var role = String(payload.role || ROLES.STAFF).trim();
+      if (!Auth.canGrantRole(admin.Role, role)) {
+        throw new Error('Only management can grant the ' + role + ' role.');
+      }
+      return StaffService.create(payload, admin.Email);
     });
 }
 
@@ -604,6 +668,9 @@ function api_staffUpdate(token, payload) {
   return withApi_({ token: token, admin: true, name: 'staffUpdate', write: true },
     function (admin) {
       payload = payload || {};
+      if (payload.role !== undefined && !Auth.canGrantRole(admin.Role, payload.role)) {
+        throw new Error('Only management can grant the ' + String(payload.role) + ' role.');
+      }
       return StaffService.update(payload.staffId, payload, admin.Email);
     });
 }
@@ -716,9 +783,8 @@ function api_taskDetail(token, taskId) {
     };
   });
 }
-
 function api_taskCreate(token, payload) {
-  return withApi_({ token: token, admin: true, name: 'taskCreate', write: true },
+  return withApi_({ token: token, taskManager: true, name: 'taskCreate', write: true },
     function (admin) {
       payload = payload || {};
       if (Array.isArray(payload.assignTo) && payload.assignTo.length > 1) {
@@ -731,7 +797,6 @@ function api_taskCreate(token, payload) {
       return mapTask_(task);
     });
 }
-
 function api_taskUpdate(token, payload) {
   return withApi_({ token: token, admin: true, name: 'taskUpdate', write: true },
     function (admin) {
@@ -754,7 +819,8 @@ function api_taskReassign(token, payload) {
     function (admin) {
       payload = payload || {};
       return TaskService.reassign(payload.taskId, payload.staffId, admin.Email,
-        { reactivate: payload.reactivate, dueDate: payload.dueDate });
+        { reactivate: payload.reactivate, dueDate: payload.dueDate,
+          followUp: payload.followUp });
     });
 }
 
@@ -806,6 +872,72 @@ function api_taskReject(token, payload) {
     });
 }
 
+/** Requirement 4 — reverse an approved task back to pending validation. */
+function api_taskReverse(token, payload) {
+  return withApi_({ token: token, admin: true, name: 'taskReverse', write: true },
+    function (admin) {
+      payload = payload || {};
+      return TaskService.reverse(payload.taskId, admin, payload.comment);
+    });
+}
+
+/**
+ * Requirement 3 — a staff member escalates their task to a Software Developer.
+ * Any signed-in staff member may escalate a task assigned to them; a task
+ * manager/admin may escalate any task.
+ */
+function api_taskEscalate(token, payload) {
+  return withApi_({ token: token, name: 'taskEscalate', write: true }, function (staff) {
+    payload = payload || {};
+    var task = TaskService.byId(payload.taskId);
+    if (!task) throw new Error('Task not found.');
+    if (String(task.AssignedTo) !== String(staff.StaffID) &&
+        !Auth.canAssignTasks(staff)) {
+      throw new Error('You can only escalate a task assigned to you.');
+    }
+    return TaskService.escalate(payload.taskId, staff, payload.developerId, payload.note);
+  });
+}
+
+/**
+ * Requirement 3 — the developer it was escalated to (or management) resolves
+ * and validates the task. TaskService.resolveEscalation enforces the check.
+ */
+function api_taskResolveEscalation(token, payload) {
+  return withApi_({ token: token, name: 'taskResolveEscalation', write: true },
+    function (staff) {
+      payload = payload || {};
+      return TaskService.resolveEscalation(payload.taskId, staff, payload);
+    });
+}
+
+/** Software Developers available as escalation targets. Any staff member may read it. */
+function api_developerList(token) {
+  return withApi_({ token: token, name: 'developerList' }, function () {
+    return StaffService.all().filter(function (s) {
+      return Auth.isDeveloper(s.Role) && String(s.Status) !== STAFF_STATUS.INACTIVE;
+    }).map(function (s) {
+      return {
+        staffId: String(s.StaffID),
+        name: String(s.Name),
+        email: String(s.Email),
+        department: String(s.Department || '')
+      };
+    }).sort(function (a, b) { return a.name.localeCompare(b.name); });
+  });
+}
+
+/**
+ * Tasks escalated to the caller (a Software Developer) and still open —
+ * requirement 3. Powers the developer's dedicated "Escalated to me" view so an
+ * escalation is impossible to miss, in addition to the dashboard card.
+ */
+function api_escalatedToMe(token) {
+  return withApi_({ token: token, name: 'escalatedToMe' }, function (staff) {
+    return TaskService.forDeveloper(staff.StaffID).map(mapTask_);
+  });
+}
+
 /* ---------------------------------------------------------------------------
  * Daily reports
  * ------------------------------------------------------------------------- */
@@ -848,7 +980,8 @@ function api_dailyReportReview(token, payload) {
 
 function api_signAttendance(token, payload) {
   return withApi_({ token: token, name: 'signAttendance', write: true }, function (staff) {
-    return AttendanceService.signIn(staff, (payload || {}).note);
+    payload = payload || {};
+    return AttendanceService.signIn(staff, payload.note, payload.meta);
   });
 }
 
@@ -883,7 +1016,12 @@ function api_attendanceList(token, filters) {
         logoutTime: Util.fmtTime(a.LogoutTime),
         status: String(a.Status),
         minutesLate: Util.num(a.MinutesLate, 0),
-        notes: String(a.Notes || '')
+        notes: String(a.Notes || ''),
+        deviceType: String(a.DeviceType || ''),
+        latitude: a.Latitude !== '' && a.Latitude != null ? Util.num(a.Latitude, null) : null,
+        longitude: a.Longitude !== '' && a.Longitude != null ? Util.num(a.Longitude, null) : null,
+        distanceMeters: a.DistanceMeters !== '' && a.DistanceMeters != null ? Util.num(a.DistanceMeters, null) : null,
+        locationFlagged: Util.truthy(a.LocationFlagged)
       };
     }).sort(function (a, b) { return String(b.date).localeCompare(String(a.date)); });
   });
@@ -1002,7 +1140,7 @@ function api_reportList(token, filters) {
  * ------------------------------------------------------------------------- */
 
 function api_payrollPreview(token, payload) {
-  return withApi_({ token: token, admin: true, name: 'payrollPreview' }, function () {
+  return withApi_({ token: token, management: true, name: 'payrollPreview' }, function () {
     payload = payload || {};
     var period = Util.resolvePeriod(payload.periodType || 'Monthly', payload.refDate);
     return {
@@ -1018,7 +1156,7 @@ function api_payrollPreview(token, payload) {
 }
 
 function api_payrollRun(token, payload) {
-  return withApi_({ token: token, admin: true, name: 'payrollRun', write: true },
+  return withApi_({ token: token, management: true, name: 'payrollRun', write: true },
     function (admin) {
       payload = payload || {};
       var out = PayrollService.runPeriod(payload.periodType, payload.refDate, admin.Email);
@@ -1028,7 +1166,7 @@ function api_payrollRun(token, payload) {
 }
 
 function api_payrollAdjust(token, payload) {
-  return withApi_({ token: token, admin: true, name: 'payrollAdjust', write: true },
+  return withApi_({ token: token, management: true, name: 'payrollAdjust', write: true },
     function (admin) {
       payload = payload || {};
       return PayrollService.setAdjustment(payload.payrollId, payload.amount, payload.note, admin);
@@ -1036,14 +1174,14 @@ function api_payrollAdjust(token, payload) {
 }
 
 function api_payrollApprove(token, payload) {
-  return withApi_({ token: token, admin: true, name: 'payrollApprove', write: true },
+  return withApi_({ token: token, management: true, name: 'payrollApprove', write: true },
     function (admin) {
       return PayrollService.approve((payload || {}).payrollId, admin);
     });
 }
 
 function api_payrollMarkPaid(token, payload) {
-  return withApi_({ token: token, admin: true, name: 'payrollMarkPaid', write: true },
+  return withApi_({ token: token, management: true, name: 'payrollMarkPaid', write: true },
     function (admin) {
       payload = payload || {};
       return PayrollService.markPaid(payload.payrollId, admin, payload.reference);

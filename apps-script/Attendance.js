@@ -50,7 +50,7 @@ var AttendanceService = {
    * Requirement 3.9 — the Sign Attendance button. Idempotent per day; the
    * caller wraps this in SheetDB.withLock().
    */
-  signIn: function (staff, note) {
+    signIn: function (staff, note, meta) {
     Auth.assertCanAct(staff);
 
     var today = Util.today();
@@ -69,8 +69,6 @@ var AttendanceService = {
 
     var status, minutesLate = 0;
     if (!workingDay) {
-      // Off-roster day: credit the sign-in, do not judge the clock, and do not
-      // relabel it a Holiday — statsFor() leaves these rows out of the rate.
       status = ATTENDANCE_STATUS.ON_TIME;
     } else if (minutes <= deadline) {
       status = ATTENDANCE_STATUS.ON_TIME;
@@ -85,6 +83,38 @@ var AttendanceService = {
         'Signed in on a non-working day — excluded from the attendance rate.';
     }
 
+    // ---- device + geofence handling ----
+    meta = meta || {};
+    var deviceType = String(meta.deviceType || 'Unknown').slice(0, 100);
+    var lat = (meta.latitude !== undefined && meta.latitude !== null && meta.latitude !== '')
+      ? Number(meta.latitude) : null;
+    var lng = (meta.longitude !== undefined && meta.longitude !== null && meta.longitude !== '')
+      ? Number(meta.longitude) : null;
+
+       var officeLat = CFG.num('OfficeLatitude', null);
+    var officeLng = CFG.num('OfficeLongitude', null);
+    var radius = CFG.num('GeofenceRadiusMeters', 300);
+    var isDesktop = /^Desktop/i.test(deviceType);
+
+    var distance = null, flagged = false;
+    if (lat != null && lng != null && officeLat != null && officeLng != null) {
+      distance = Math.round(Util.haversineMeters(lat, lng, officeLat, officeLng));
+      flagged = distance > radius;
+    } else if ((lat == null || lng == null) && !isDesktop) {
+      // Desktops routinely can't provide GPS — only flag missing location on
+      // mobile devices, where it usually means the person declined permission.
+      flagged = true;
+      notes = (notes ? notes + ' · ' : '') + 'No location data received from device.';
+    } else if ((lat == null || lng == null) && isDesktop) {
+      notes = (notes ? notes + ' · ' : '') + 'Desktop sign-in — location not available.';
+    }
+
+    if (flagged && distance != null) {
+      notes = (notes ? notes + ' · ' : '') +
+        'Location flagged: ' + distance + 'm from office (limit ' + radius + 'm).';
+    }
+    // ---- end new block ----
+
     var payload = {
       StaffID: String(staff.StaffID),
       StaffName: String(staff.Name),
@@ -94,11 +124,15 @@ var AttendanceService = {
       Status: status,
       MinutesLate: minutesLate,
       Notes: notes,
-      RecordedAt: now
+      RecordedAt: now,
+      DeviceType: deviceType,
+      Latitude: lat,
+      Longitude: lng,
+      DistanceMeters: distance,
+      LocationFlagged: flagged
     };
 
     if (existing) {
-      // Overwrite an Absent placeholder left by the nightly sweep.
       SheetDB.updateRowAt(SHEETS.ATTENDANCE, existing.__row, payload);
       payload.AttendanceID = existing.AttendanceID;
     } else {
@@ -115,8 +149,16 @@ var AttendanceService = {
         CFG.get('AttendanceDeadline', '09:00') + ' deadline.');
     }
 
+    if (flagged) {
+      NotificationService.push(staff.StaffID, 'AttendanceLocationFlag', 'warn',
+        'Sign-in location flagged',
+        distance != null
+          ? 'You signed in ' + distance + 'm from the office (outside the ' + radius + 'm limit).'
+          : 'Your device did not share a location for this sign-in.');
+    }
+
     Log.info('Attendance', staff.StaffID + ' signed in ' + status +
-      ' at ' + Util.fmtTime(now));
+      ' at ' + Util.fmtTime(now) + ' [' + deviceType + ', flagged=' + flagged + ']');
 
     return {
       attendanceId: payload.AttendanceID,
@@ -125,10 +167,12 @@ var AttendanceService = {
       minutesLate: minutesLate,
       workingDay: workingDay,
       staffId: String(staff.StaffID),
-      staffName: String(staff.Name)
+      staffName: String(staff.Name),
+      deviceType: deviceType,
+      distanceMeters: distance,
+      locationFlagged: flagged
     };
   },
-
   /** Optional close-of-day sign-out, used to compute hours on site. */
   signOut: function (staff) {
     var rec = this.recordFor(staff.StaffID, Util.dateKey(Util.today()));
@@ -189,7 +233,7 @@ var AttendanceService = {
     var rows = [];
     StaffService.all().forEach(function (staff) {
       if (String(staff.Status) === STAFF_STATUS.INACTIVE) return;
-      if (String(staff.Role) === ROLES.ADMIN) return;   // admins are not swept
+      if (Auth.isAttendanceExempt(staff.Role)) return;   // management is not swept
       if (AttendanceService.recordFor(staff.StaffID, todayKey)) return;
 
       rows.push({
@@ -235,7 +279,7 @@ var AttendanceService = {
 
     StaffService.all().forEach(function (staff) {
       if (String(staff.Status) !== STAFF_STATUS.ACTIVE) return;
-      if (String(staff.Role) === ROLES.ADMIN) return;
+      if (Auth.isAttendanceExempt(staff.Role)) return;
       if (AttendanceService.recordFor(staff.StaffID, todayKey)) return;
       try {
         Notify.attendanceReminder(staff);
@@ -295,7 +339,7 @@ var AttendanceService = {
   },
 
   /** Today's roll-call, used by the admin dashboard. */
-  todayBoard: function () {
+    todayBoard: function () {
     var todayKey = Util.dateKey(Util.today());
     var out = { date: todayKey, onTime: 0, late: 0, absent: 0, notSigned: 0, rows: [] };
 
@@ -308,14 +352,17 @@ var AttendanceService = {
       else if (status === ATTENDANCE_STATUS.ABSENT) out.absent++;
       else out.notSigned++;
 
-      out.rows.push({
+            out.rows.push({
         staffId: String(staff.StaffID),
         name: String(staff.Name),
         department: String(staff.Department || ''),
         status: status,
         loginTime: rec ? Util.fmtTime(rec.LoginTime) : '',
         minutesLate: rec ? Util.num(rec.MinutesLate, 0) : 0,
-        photoUrl: String(staff.PhotoUrl || '')
+        photoUrl: String(staff.PhotoUrl || ''),
+        deviceType: rec ? String(rec.DeviceType || '') : '',
+        distanceMeters: rec && rec.DistanceMeters !== '' && rec.DistanceMeters != null ? Util.num(rec.DistanceMeters, null) : null,
+        locationFlagged: rec ? Util.truthy(rec.LocationFlagged) : false
       });
     });
     return out;

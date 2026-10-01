@@ -455,6 +455,7 @@ var Notify = (function () {
           ['Gross allocated', Util.fmtMoney(payrollRow.GrossAllocated)],
           ['Earned on progress', Util.fmtMoney(payrollRow.ProgressEarned)],
           ['Penalties', Util.fmtMoney(payrollRow.Penalties)],
+          ['Lateness deduction', Util.fmtMoney(payrollRow.LateDeduction)],
           ['Adjustments', Util.fmtMoney(payrollRow.Adjustments)],
           ['Net paid', Util.fmtMoney(payrollRow.NetPay)],
           ['Reference', String(payrollRow.Reference || '—')]
@@ -492,6 +493,48 @@ var Notify = (function () {
         ],
         body: '<p><a href="' + record.DriveUrl + '">Open the file in Google Drive</a></p>',
         cta: cta('Open admin dashboard')
+      }));
+    },
+
+    /**
+     * A task has been escalated (handed) to a developer. Emailed to the
+     * developer immediately: they own the work now and validate it when done.
+     */
+    taskEscalated: function (developer, task, fromStaff, note) {
+      return send(developer.Email, 'Escalated to you — action needed: ' + task.Title, render({
+        title: 'A task has been escalated to you',
+        intro: 'Hello ' + developer.Name + ', "' + task.Title + '" needs your attention immediately.',
+        rows: [
+          ['Task', task.Title + ' (' + task.TaskID + ')'],
+          ['Type', task.TaskType],
+          ['Priority', task.Priority],
+          ['Due', Util.fmtDate(task.DueDate)],
+          ['Escalated by', fromStaff ? (fromStaff.Name + ' (' + fromStaff.StaffID + ')') : '—']
+        ],
+        body: (task.Description ? '<p>' + Util.escapeHtml(task.Description) + '</p>' : '') +
+              (note ? '<p><strong>Note:</strong> ' + Util.escapeHtml(note) + '</p>' : '') +
+              '<p>Please work on this now. When it is done, open it in your portal and ' +
+              '<strong>validate</strong> it — that resolves it for ' +
+              (fromStaff ? fromStaff.Name : 'the original assignee') + '.</p>',
+        accent: 'red',
+        cta: cta('Open my tasks')
+      }));
+    },
+
+    /** The escalated task has been resolved by the developer — tell the original staff. */
+    escalationResolved: function (staff, task, developer) {
+      return send(staff.Email, 'Resolved: ' + task.Title, render({
+        title: 'Your escalated task is resolved',
+        intro: 'Hello ' + staff.Name + ', "' + task.Title + '" has been resolved by ' +
+               (developer ? developer.Name : 'a developer') + '.',
+        rows: [
+          ['Task', task.Title + ' (' + task.TaskID + ')'],
+          ['Resolved by', developer ? (developer.Name + ' (' + developer.StaffID + ')') : '—']
+        ],
+        body: '<p>The task now shows as <strong>Resolved</strong> on your dashboard. ' +
+              'No further action is needed from you.</p>',
+        accent: 'green',
+        cta: cta('Open my tasks')
       }));
     }
   };

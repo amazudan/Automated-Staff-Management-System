@@ -46,7 +46,7 @@ SCHEMA[SHEETS.STAFF] = [
   'DateAdded', 'Status', 'StrikeCount', 'FlaggedStatus', 'SuspendedAt',
   'SuspensionCount', 'TotalStrikesIssued', 'ClearedAt', 'ClearedBy',
   'ClearanceNote', 'PinHash', 'PinSalt', 'LastLogin', 'PhotoUrl', 'Notes',
-  'MonthlySalary'
+  'MonthlySalary', 'AccessLevel', 'CanAssignTasks'
 ];
 
 SCHEMA[SHEETS.TASKS] = [
@@ -56,7 +56,9 @@ SCHEMA[SHEETS.TASKS] = [
   'PayableAmount', 'AcknowledgedAt', 'SubmittedAt', 'ValidatedAt',
   'ValidatedBy', 'CompletedAt', 'MetricScore', 'AdminRating', 'AdminComment',
   'RolloverCount', 'WarningsIssued', 'IsPriority', 'ParentTaskID',
-  'AttachmentUrl', 'CreatedAt', 'LastUpdated'
+  'AttachmentUrl', 'CreatedAt', 'LastUpdated',
+  'EscalatedTo', 'EscalatedToName', 'EscalatedBy', 'EscalatedAt',
+  'EscalationStatus', 'ResolvedAt'
 ];
 
 SCHEMA[SHEETS.DAILY_REPORTS] = [
@@ -99,7 +101,7 @@ SCHEMA[SHEETS.PAYROLL] = [
   'PeriodStart', 'PeriodEnd', 'TasksConsidered', 'GrossAllocated',
   'ProgressEarned', 'Penalties', 'Adjustments', 'NetPay', 'Status',
   'ApprovedBy', 'ApprovedAt', 'PaidAt', 'Reference', 'Notes', 'CreatedAt',
-  'GuaranteedSalary', 'Forfeited'
+  'GuaranteedSalary', 'Forfeited', 'LateDeduction'
 ];
 
 SCHEMA[SHEETS.UPLOADS] = [
@@ -174,7 +176,23 @@ var STAFF_STATUS = {
   SUSPENDED: 'Suspended'
 };
 
-var ROLES = { ADMIN: 'Admin', MANAGER: 'Manager', STAFF: 'Staff' };
+/**
+ * Roles.
+ * The four live roles are Management, Operations, Software Developer and Staff.
+ * Legacy 'Admin' / 'Manager' rows are still honoured everywhere (see Auth.js):
+ * a legacy Admin behaves as Management, a legacy Manager as Operations.
+ */
+var ROLES = {
+  MANAGEMENT: 'Management',
+  OPERATIONS: 'Operations',
+  DEVELOPER:  'Software Developer',
+  STAFF:      'Staff',
+  ADMIN:      'Admin',      // legacy → treated as Management
+  MANAGER:    'Manager'     // legacy → treated as Operations
+};
+
+/** The four roles offered in the UI when creating or editing staff. */
+var ASSIGNABLE_ROLES = [ROLES.MANAGEMENT, ROLES.OPERATIONS, ROLES.DEVELOPER, ROLES.STAFF];
 
 var ATTENDANCE_STATUS = {
   ON_TIME: 'OnTime',
@@ -241,6 +259,7 @@ var DEFAULT_CONFIG = [
   ['MinProgressForPay',            '0',               'Payroll',      'Validated progress below this percent pays nothing.'],
   ['PayRoundTo',                   '2',               'Payroll',      'Decimal places for money.'],
   ['DefaultPayrollPeriod',         'Monthly',         'Payroll',      'Period used by the payroll screen on first load.'],
+  ['LateDeductionPerDay',          '500',             'Payroll',      'Flat amount deducted from pay for each late sign-in in the period.'],
 
   // --- Guaranteed salary -> automatic task allocation ----------------------
   // Each staff member has a guaranteed monthly salary (Staff.MonthlySalary).

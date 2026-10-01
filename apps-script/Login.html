@@ -58,14 +58,20 @@
       '<p class="small muted center mt">Forgot your PIN? An administrator can reset it for you.</p>';
   }
 
-  function panelNormal(boot, company, logoUrl) {
+  function panelNormal(boot, company, logoUrl, admin) {
     var mode = (boot.config && boot.config.authMode) || 'Hybrid';
     var google = boot.googleEmail || '';
     var match = !!boot.googleMatch;
+    var badge = admin
+      ? '<div style="display:inline-block;margin:2px 0 10px;padding:4px 11px;border-radius:999px;' +
+        'background:rgba(37,99,235,.12);color:#2563eb;font-weight:600;font-size:12px;letter-spacing:.03em">MANAGEMENT</div>'
+      : '';
     var html = '' +
-      brandBlock(company, logoUrl) +
-      '<h1 class="login-title">Welcome back</h1>' +
-      '<p class="login-sub">Sign in to your ' + UI.esc(company) + ' workspace.</p>';
+      brandBlock(company, logoUrl) + badge +
+      '<h1 class="login-title">' + (admin ? 'Management sign-in' : 'Welcome back') + '</h1>' +
+      '<p class="login-sub">' + (admin
+        ? 'Back office for management &amp; operations at ' + UI.esc(company) + '.'
+        : 'Sign in to your ' + UI.esc(company) + ' workspace.') + '</p>';
 
     // Only offer one-tap when that Google address really is on staff.
     if (google && match && mode !== 'PinOnly') html += ssoBlock(google);
@@ -138,19 +144,36 @@
     var cfg = boot.config || App.state.config || {};
     var company = cfg.companyName || 'Staff Management';
     var logoUrl = cfg.companyLogoUrl || '';
+    var admin = (typeof App !== 'undefined' && App.entrance) ? App.entrance() === 'admin' : false;
     var panel = boot.setupNeeded
       ? panelSetupNeeded(company, logoUrl)
-      : panelNormal(boot, company, logoUrl);
+      : panelNormal(boot, company, logoUrl, admin);
 
     root.innerHTML =
       '<div class="login">' +
-      '<div class="login-panel"><div class="login-card">' + panel + '</div>' +
-      '<div class="login-legal">Private workspace · access is limited to registered staff.</div>' +
+      '<div class="login-panel"><div class="login-card">' + panel +
+      (boot.setupNeeded ? '' : crossDoor(admin)) + '</div>' +
+      '<div class="login-legal">' + (admin
+        ? 'Management console · management &amp; operations only.'
+        : 'Private workspace · access is limited to registered staff.') + '</div>' +
       '</div></div>';
 
     wire(root);
     var focusEl = root.querySelector('#loginPin, #loginEmail');
     if (focusEl && !focusEl.value) try { focusEl.focus(); } catch (e) {}
+  }
+
+  /**
+   * A link to the other entrance. The staff login page must NOT advertise the
+   * management door — only the management page offers a way back to staff
+   * sign-in. (Requirement: remove the management login link from the staff page.)
+   */
+  function crossDoor(admin) {
+    if (!admin) return '';
+    var base = (typeof App !== 'undefined' && App.scriptUrl) ? App.scriptUrl() : '';
+    if (!base) return '';
+    return '<p class="small muted center mt"><a href="' + UI.esc(base) +
+      '" target="_top">← Staff sign-in</a></p>';
   }
 
   window.LoginUI = {

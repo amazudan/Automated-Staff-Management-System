@@ -234,8 +234,8 @@
    * Staff directory for admin pickers, fetched once per session.
    * @return {Promise<Array>} [{staffId, name, department, role, email}]
    */
-  App.staffDirectory = function () {
-    if (!(App.state.profile && App.state.profile.isAdmin)) return Promise.resolve([]);
+    App.staffDirectory = function () {
+    if (!(App.state.profile && (App.state.profile.isAdmin || App.state.profile.canAssignTasks))) return Promise.resolve([]);
     if (App._directory) return Promise.resolve(App._directory);
     return App.api('api_staffDirectory').then(function (rows) {
       App._directory = rows || [];
@@ -387,6 +387,15 @@
     return (App.state.profile && App.state.profile.isAdmin) ? window.AdminUI : window.StaffUI;
   };
 
+  /** Which door the visitor used: 'admin' (management entrance) or 'app'. */
+  App.entrance = function () {
+    var p = String(window.BOOT_PAGE || '').toLowerCase();
+    return (p === 'admin' || p === 'management') ? 'admin' : 'app';
+  };
+
+  /** Absolute /exec URL (from the server), for building cross-door links. */
+  App.scriptUrl = function () { return window.SCRIPT_URL || ''; };
+
   App.period = function () { return App.state.period; };
 
   App.periodLabel = function (t) {
@@ -404,8 +413,9 @@
   };
 
   function renderNav() {
-    var ui = App.activeUI(), nav = $('navMain');
-    nav.innerHTML = (ui.nav || []).map(function (grp) {
+  var ui = App.activeUI(), nav = $('navMain');
+  var navDef = typeof ui.nav === 'function' ? ui.nav() : ui.nav;
+  nav.innerHTML = (navDef || []).map(function (grp) {
       return (grp.group ? '<div class="nav-group">' + UI.esc(grp.group) + '</div>' : '') +
         grp.items.map(function (it) {
           return '<button class="nav-item" data-view="' + it.id + '">' +
@@ -546,7 +556,41 @@
     App.state.profile = out.profile;
     if (out.config) App.state.config = out.config;
     App._directory = null;          // a new session gets a fresh staff picker
+    // Management entrance is for management & operations only. A plain staff
+    // member who followed the management link is offered their own workspace
+    // rather than being locked out.
+    if (App.entrance() === 'admin' && !(out.profile && out.profile.isAdmin)) {
+      App.showWrongDoor();
+      return;
+    }
     App.showApp();
+  };
+
+  /**
+   * Shown when a non-admin signs in at the management entrance. They are
+   * authenticated; they just belong in the staff workspace.
+   */
+  App.showWrongDoor = function () {
+    $('splash').classList.add('hidden');
+    $('appRoot').classList.add('hidden');
+    var root = $('loginRoot');
+    root.classList.remove('hidden');
+    var p = App.state.profile || {};
+    var staffUrl = App.scriptUrl();
+    root.innerHTML =
+      '<div class="login"><div class="login-panel"><div class="login-card">' +
+      '<div class="brand-mark lg">✓</div>' +
+      '<h1 class="login-title">Staff workspace</h1>' +
+      '<p class="login-sub">Hi ' + UI.esc(p.name || 'there') + ' — the management entrance is for ' +
+        'management &amp; operations. Your account (' + UI.esc(p.role || 'Staff') +
+        ') uses the staff workspace.</p>' +
+      '<button class="btn btn-brand block mt" id="toStaff">Continue to my workspace</button>' +
+      (staffUrl ? '<a class="btn btn-ghost block mt" href="' + UI.esc(staffUrl) +
+        '" target="_top">Staff sign-in link</a>' : '') +
+      '</div><div class="login-legal">Private workspace · access is limited to registered staff.</div>' +
+      '</div></div>';
+    var b = root.querySelector('#toStaff');
+    if (b) b.addEventListener('click', function () { App.showApp(); });
   };
 
   App.onAuthLost = function () {
@@ -763,13 +807,17 @@
     },
 
     /** SVG semicircle gauge from analytics.gauge. */
-    gauge: function (g) {
+       gauge: function (g) {
       g = g || { total: 0, completed: 0, pending: 0, inProgress: 0, completedPct: 0 };
       var cx = 100, cy = 100, r = 78, W = 200, H = 116;
       function pt(f) { var a = Math.PI * (1 - f); return [cx + r * Math.cos(a), cy - r * Math.sin(a)]; }
       function arc(f0, f1, color) {
         if (f1 <= f0) return '';
-        var a = pt(f0), b = pt(f1), large = (f1 - f0) > 0.5 ? 1 : 0;
+        var a = pt(f0), b = pt(f1);
+        // This gauge only ever draws a half-circle (180°), so no single
+        // segment can ever need the SVG large-arc-flag — it only applies
+        // to sweeps over 180°, and the whole gauge tops out at 180°.
+        var large = 0;
         return '<path d="M' + a[0].toFixed(1) + ' ' + a[1].toFixed(1) + ' A' + r + ' ' + r +
           ' 0 ' + large + ' 1 ' + b[0].toFixed(1) + ' ' + b[1].toFixed(1) +
           '" fill="none" stroke="' + color + '" stroke-width="15" stroke-linecap="round"/>';

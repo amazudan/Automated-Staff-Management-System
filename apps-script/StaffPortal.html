@@ -230,20 +230,55 @@
   /* ======================================================================
      ATTENDANCE / PROFILE ACTIONS
      ====================================================================== */
-  function signIn() {
-    App.busy(true);
-    App.api('api_signAttendance', {}).then(function (r) {
-      App.busy(false);
-      r = r || {};
-      // Requirement 2 — name the person the record was written for, so a wrong
-      // identity can never go unnoticed again, and never call it a holiday.
-      var who = r.staffName ? ' for ' + r.staffName : '';
-      var late = r.minutesLate ? ' — ' + r.minutesLate + ' min late' : '';
-      var extra = (r.workingDay === false) ? ' (outside your roster — logged anyway)' : '';
-      App.toast('Signed in' + who + late + extra + '.', r.minutesLate ? 'warn' : 'good');
-      App.refresh();
-    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
-  }
+  /** Best-effort device fingerprint — never blocks sign-in if it fails. */
+function getDeviceType() {
+  try {
+    var ua = navigator.userAgent || '';
+    var isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
+    var os = /Windows/i.test(ua) ? 'Windows'
+      : /Mac OS/i.test(ua) ? 'macOS'
+      : /Android/i.test(ua) ? 'Android'
+      : /iPhone|iPad|iPod/i.test(ua) ? 'iOS'
+      : /Linux/i.test(ua) ? 'Linux'
+      : 'Unknown';
+    return (isMobile ? 'Mobile' : 'Desktop') + ' · ' + os;
+  } catch (e) { return 'Unknown'; }
+}
+
+/** Resolves with {latitude, longitude} or nulls if unavailable/denied/timeout. */
+function getLocation() {
+  return new Promise(function (resolve) {
+    if (!navigator.geolocation) return resolve({ latitude: null, longitude: null });
+    navigator.geolocation.getCurrentPosition(
+      function (pos) {
+        resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
+      },
+      function () { resolve({ latitude: null, longitude: null }); },
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+    );
+  });
+}
+
+function signIn() {
+  App.busy(true);
+  getLocation().then(function (loc) {
+    var meta = {
+      deviceType: getDeviceType(),
+      latitude: loc.latitude,
+      longitude: loc.longitude
+    };
+    return App.api('api_signAttendance', { meta: meta });
+  }).then(function (r) {
+    App.busy(false);
+    r = r || {};
+    var who = r.staffName ? ' for ' + r.staffName : '';
+    var late = r.minutesLate ? ' — ' + r.minutesLate + ' min late' : '';
+    var extra = (r.workingDay === false) ? ' (outside your roster — logged anyway)' : '';
+    var flag = r.locationFlagged ? ' ⚠ location flagged for review' : '';
+    App.toast('Signed in' + who + late + extra + flag + '.', (r.minutesLate || r.locationFlagged) ? 'warn' : 'good');
+    App.refresh();
+  }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+}
   function signOut() {
     App.busy(true);
     App.api('api_signOutAttendance').then(function () { App.busy(false); App.toast('Signed out. See you tomorrow.', 'good'); App.refresh(); })
@@ -341,6 +376,86 @@
    * member never has to guess what to do with a task that has just appeared.
    * Pass {actions:false} for compact dashboard lists.
    */
+  /* Requirement 3 — "Escalate to boss". Hand the task to a Software Developer.
+     It stays assigned to me (pay attribution is unchanged); the developer is
+     emailed at once, works it and validates it, and I then see it as Resolved. */
+  function openEscalate(t) {
+    App.busy(true);
+    App.api('api_developerList', {}).then(function (devs) {
+      App.busy(false);
+      if (!devs || !devs.length) {
+        App.toast('No Software Developers are available to escalate to.', 'warn');
+        return;
+      }
+      var options = devs.map(function (d) {
+        return '<option value="' + esc(d.staffId) + '">' + esc(d.name) +
+          (d.department ? ' · ' + esc(d.department) : '') + '</option>';
+      }).join('');
+      App.modal({
+        title: 'Escalate to boss',
+        body: '<p class="muted small">Hand “' + esc(t.title) + '” to a Software Developer. They are ' +
+            'emailed immediately and will work on it and validate it. It stays assigned to you and ' +
+            'shows as <b>Resolved</b> on your board once they are done.</p>' +
+          field('Send to', '<select data-field="developerId">' + options + '</select>') +
+          field('Note (optional)', '<textarea data-field="note" placeholder="What needs doing and why it is urgent"></textarea>'),
+        actions: [
+          { label: 'Cancel' },
+          submit('Escalate', function (c) {
+            var v = c.values();
+            if (!v.developerId) { App.toast('Choose a developer.', 'warn'); return; }
+            return App.api('api_taskEscalate', { taskId: t.taskId, developerId: v.developerId, note: v.note })
+              .then(function () {
+                App.closeModal();
+                App.toast('Escalated — the developer has been emailed.', 'good');
+                App.refresh();
+              });
+          })
+        ]
+      });
+    }).catch(function (e) {
+      App.busy(false);
+      App.toast(e && e.message ? e.message : 'Could not load developers.', 'bad');
+    });
+  }
+
+  /* Requirement 3 — the developer (or management) resolves an escalated task:
+     it becomes Completed and the original owner sees it as Resolved. */
+  function openResolve(t) {
+    App.modal({
+      title: 'Resolve — ' + t.title,
+      body: '<p class="muted small">You are validating this escalated task. Set the completion % you are ' +
+          'confirming. It becomes <b>Completed</b> and ' + esc(t.assignedToName || 'the owner') +
+          ' sees it as <b>Resolved</b>.</p>' +
+        field('Validated completion %',
+          '<input type="number" data-field="validatedProgress" data-type="number" min="0" max="100" value="100">') +
+        field('Note (optional)', '<textarea data-field="comment" placeholder="What you did"></textarea>'),
+      actions: [
+        { label: 'Cancel' },
+        submit('Resolve & validate', function (c) {
+          var v = c.values();
+          return App.api('api_taskResolveEscalation',
+            { taskId: t.taskId, validatedProgress: v.validatedProgress, comment: v.comment })
+            .then(function () {
+              App.closeModal();
+              App.toast('Resolved and validated.', 'good');
+              App.refresh();
+            });
+        })
+      ]
+    });
+  }
+
+  /* One row of the developer's "Escalated to me" list. */
+  function escalatedRow(t) {
+    return '<div class="list-item flat">' +
+      '<div style="flex:1;min-width:0;cursor:pointer" data-act="task" data-id="' + esc(t.taskId) + '">' +
+        '<div class="li-title">' + esc(t.title) + ' ' + UI.priorityPill(t.priority) +
+          (t.overdue ? ' ' + UI.pill('Overdue', 'red') : '') + '</div>' +
+        '<div class="li-sub">From ' + esc(t.assignedToName) + ' · Due ' + esc(t.dueLabel || t.dueDate || '—') + '</div>' +
+      '</div>' +
+      '<div class="right">' + actBtn('Resolve', 'resolve', t.taskId, 'btn-brand') + '</div></div>';
+  }
+
   function taskRow(t, opts) {
     opts = opts || {};
     var bits = [];
@@ -353,6 +468,11 @@
         bits.push(actBtn('Upload file', 'upload', t.taskId));
         bits.push(actBtn('Daily report', 'report', t.taskId));
         bits.push(actBtn('Submit', 'submit', t.taskId));
+        if (!t.escalated) {
+          // Raw button so we can carry a "Escalate to boss" tooltip (actBtn has none).
+          bits.push('<button class="btn xs" title="Escalate to boss" data-act="escalate" data-id="' +
+            esc(t.taskId) + '">Escalate</button>');
+        }
       }
     }
     var bar = (isOpen(t) || t.reportedProgress || t.validatedProgress)
@@ -372,6 +492,8 @@
         (bits.length ? '<div class="task-actions" style="margin-top:8px">' + bits.join('') + '</div>' : '') +
       '</div>' +
       '<div class="right" style="min-width:96px">' + UI.taskPill(t.status) +
+        (t.resolved ? ' ' + UI.pill('Resolved', 'green')
+                    : (t.escalated ? ' ' + UI.pill('Escalated', 'amber') : '')) +
         '<div class="li-sub">' + UI.pct(t.effectiveProgress) + ' · ' + money(t.payable) + '</div></div></div>';
   }
 
@@ -387,7 +509,9 @@
         withTask(id).then(function (t) {
           App.openUpload({ taskId: t.taskId, taskTitle: t.title, category: 'TaskDeliverable' });
         });
-      }
+      },
+      escalate: function (id) { withTask(id).then(openEscalate); },
+      resolve: function (id) { withTask(id).then(openResolve); }
     };
   }
 
@@ -419,15 +543,19 @@
         App.setBadge('tasks', d.board.inProgress);
 
         var b = d.board;
-        var kpis = UI.grid('g-4', [
+                var restricted = isRestricted_();
+        var kpiCards = [
           UI.kpi({ label: 'Completed', value: b.completed, icon: '✅', foot: 'of ' + b.total + ' tasks' }),
           UI.kpi({ label: 'Yet to validate', value: b.pending, icon: '🕵️', foot: 'With your manager' }),
-          UI.kpi({ label: 'In progress', value: b.inProgress, icon: '🔧', foot: b.overdue + ' overdue' }),
-          UI.kpi({ label: 'Net pay', value: money(d.pay.netPay), icon: '💰', dark: true,
-                   foot: d.pay.guaranteed
-                     ? 'of ' + money(d.pay.guaranteed) + ' guaranteed · ' + d.pay.periodLabel
-                     : d.pay.periodLabel })
-        ].join(''));
+          UI.kpi({ label: 'In progress', value: b.inProgress, icon: '🔧', foot: b.overdue + ' overdue' })
+        ];
+        if (!restricted) {
+          kpiCards.push(UI.kpi({ label: 'Net pay', value: money(d.pay.netPay), icon: '💰', dark: true,
+            foot: d.pay.guaranteed
+              ? 'of ' + money(d.pay.guaranteed) + ' guaranteed · ' + d.pay.periodLabel
+              : d.pay.periodLabel }));
+        }
+        var kpis = UI.grid(restricted ? 'g-3' : 'g-4', kpiCards.join(''));
 
         var alerts = '';
         var fresh = (d.buckets.inProgress || []).filter(needsAck);
@@ -478,19 +606,31 @@
               '<div class="right">' + money(s.penaltyAmount) + '</div></div>';
           }).join('') : '<div class="muted small">Clean record — keep it up.</div>');
 
-        var bottom = UI.grid('g-2',
-          UI.card({ title: 'Earnings breakdown',
-                    sub: d.pay.autoAllocated && d.pay.guaranteed
-                      ? money(d.pay.guaranteed) + ' guaranteed · ' + UI.pct(d.pay.payoutRate) + ' released'
-                      : UI.pct(d.pay.payoutRate) + ' of allocated',
-                    actions: actBtn('Details', 'go', 'earnings'), body: payBody }) +
-          UI.card({ title: 'My conduct record', sub: 'Strikes are permanent once issued', body: discBody }));
+               var bottom = restricted
+          ? UI.grid('g-1', UI.card({ title: 'My conduct record', sub: 'Strikes are permanent once issued', body: discBody }))
+          : UI.grid('g-2',
+              UI.card({ title: 'Earnings breakdown',
+                        sub: d.pay.autoAllocated && d.pay.guaranteed
+                          ? money(d.pay.guaranteed) + ' guaranteed · ' + UI.pct(d.pay.payoutRate) + ' released'
+                          : UI.pct(d.pay.payoutRate) + ' of allocated',
+                        actions: actBtn('Details', 'go', 'earnings'), body: payBody }) +
+              UI.card({ title: 'My conduct record', sub: 'Strikes are permanent once issued', body: discBody }));
 
-        mount.innerHTML = alerts + kpis + spacer() + top + spacer() + buckets + spacer() + bottom;
+        // Requirement 3 — surface escalations for a developer: badge the nav
+        // item and show the card. Non-developers always have an empty list.
+        App.setBadge('escalated', (d.escalatedToMe || []).length);
+        var escMine = (d.escalatedToMe && d.escalatedToMe.length)
+          ? UI.card({ title: '🚀 Escalated to me',
+                      sub: d.escalatedToMe.length + ' task' + (d.escalatedToMe.length === 1 ? '' : 's') + ' handed to you to resolve',
+                      body: d.escalatedToMe.map(escalatedRow).join('') }) + spacer()
+          : '';
+
+        mount.innerHTML = alerts + kpis + spacer() + top + spacer() + escMine + buckets + spacer() + bottom;
 
         bind(mount, {
           go: function (id) { App.setView(id); },
           task: function (id) { openTaskDetail(id); },
+          resolve: function (id) { withTask(id).then(openResolve); },
           signin: function () { signIn(); },
           signout: function () { signOut(); }
         });
@@ -545,6 +685,34 @@
         });
         draw();
         bind(mount, taskRowHandlers());
+      });
+    }
+  };
+
+  /* ---------- Escalated to me (Software Developers) ----------
+     Requirement 3 — when a teammate escalates a task, it must surface on the
+     developer's dashboard. This is the dedicated, always-visible home for it,
+     alongside the "🚀 Escalated to me" card on the dashboard. */
+  views.escalated = {
+    title: 'Escalated to me',
+    sub: 'Tasks a teammate handed to you to fix and validate — resolving one marks it Completed for the owner',
+    render: function (mount) {
+      return App.api('api_escalatedToMe', {}).then(function (list) {
+        list = list || [];
+        remember(list);
+        App.setBadge('escalated', list.length);
+        mount.innerHTML = UI.card({
+          title: '🚀 Escalated to me',
+          sub: list.length + ' open escalation' + (list.length === 1 ? '' : 's'),
+          body: list.length
+            ? list.map(escalatedRow).join('')
+            : UI.empty('🎉', 'Nothing escalated to you',
+                'When a teammate escalates a task to you, it appears here and on your dashboard.')
+        });
+        bind(mount, {
+          task: function (id) { openTaskDetail(id); },
+          resolve: function (id) { withTask(id).then(openResolve); }
+        });
       });
     }
   };
@@ -671,6 +839,8 @@
 
         var penalties = c.penalties ? '<div class="notice danger small"><div>Strike penalties this period: <b>' + money(c.penalties) + '</b> deducted.</div></div>' + spacer(12) : '';
 
+        var lateness = c.lateDeduction ? '<div class="notice danger small"><div>Lateness this period: <b>' + money(c.lateDeduction) + '</b> deducted for <b>' + c.lateDays + '</b> late sign-in' + (c.lateDays === 1 ? '' : 's') + '.</div></div>' + spacer(12) : '';
+
         var histBody = hist.length ? UI.table({
           cols: [
             { label: 'Period', render: function (h) { return esc(h.periodLabel); } },
@@ -678,13 +848,14 @@
             { label: 'Earned', align: 'right', render: function (h) { return money(h.progressEarned); } },
             { label: 'Forfeited', align: 'right', render: function (h) { return h.forfeited ? '<span class="muted">' + money(h.forfeited) + '</span>' : '—'; } },
             { label: 'Penalties', align: 'right', render: function (h) { return money(h.penalties); } },
+            { label: 'Lateness', align: 'right', render: function (h) { return money(h.lateDeduction || 0); } },
             { label: 'Net', align: 'right', render: function (h) { return '<b>' + money(h.netPay) + '</b>'; } },
             { label: 'Status', render: function (h) { return UI.payPill(h.status); } },
             { label: 'Paid', render: function (h) { return esc(h.paidAt || '—'); } }
           ], rows: hist
         }) : UI.empty('🗓️', 'No payroll history yet');
 
-        mount.innerHTML = kpis + spacer() + explain + penalties +
+        mount.innerHTML = kpis + spacer() + explain + penalties + lateness +
           UI.card({ title: 'How this period pays',
                     sub: 'Your share of the guarantee × the validated percentage',
                     body: lines }) + spacer() +
@@ -791,12 +962,13 @@
           '<div><div class="li-sub">Email</div><div class="li-title">' + esc(p.email) + '</div></div>' +
           '<div><div class="li-sub">Phone</div><div class="li-title">' + esc(p.phone || '—') + '</div></div>' +
           '<div><div class="li-sub">Joined</div><div class="li-title">' + esc(p.dateAdded || '—') + '</div></div>' +
-          '<div><div class="li-sub">Staff ID</div><div class="li-title mono">' + esc(p.staffId) + '</div></div>' +
-          // The figure every task allocation is worked out from.
-          '<div><div class="li-sub">Guaranteed monthly salary</div><div class="li-title">' +
-            (p.monthlySalary ? money(p.monthlySalary) : '<span class="muted">not set</span>') + '</div></div>' +
+                  '<div><div class="li-sub">Staff ID</div><div class="li-title mono">' + esc(p.staffId) + '</div></div>' +
+          (isRestricted_() ? '' :
+            // The figure every task allocation is worked out from.
+            '<div><div class="li-sub">Guaranteed monthly salary</div><div class="li-title">' +
+              (p.monthlySalary ? money(p.monthlySalary) : '<span class="muted">not set</span>') + '</div></div>') +
           '</div>' +
-          (p.monthlySalary
+          (!isRestricted_() && p.monthlySalary
             ? '<p class="muted small mt">This is shared across the tasks due in each month — one task carries all of it, ' +
               'four tasks carry a quarter each — and every task pays out on its validated completion percentage. ' +
               'See <b>Earnings</b> for this month’s split.</p>'
@@ -835,24 +1007,48 @@
   /* ======================================================================
      MODULE EXPORT
      ====================================================================== */
+    function isRestricted_() {
+    var p = App.state.profile || {};
+    return String(p.accessLevel || 'Full') === 'Restricted';
+  }
+
   window.StaffUI = {
     defaultView: 'dashboard',
-    nav: [
-      { group: 'Overview', items: [{ id: 'dashboard', label: 'Dashboard', icon: '🏠' }] },
-      { group: 'My work', items: [
+    nav: function () {
+      if (isRestricted_()) {
+        return [
+          { group: 'Overview', items: [{ id: 'dashboard', label: 'Dashboard', icon: '🏠' }] },
+          { group: 'My work', items: [{ id: 'tasks', label: 'My tasks', icon: '🗂️' }] },
+          { group: 'Me', items: [
+            { id: 'attendance', label: 'Attendance', icon: '🕘' },
+            { id: 'documents', label: 'Documents', icon: '📁' }
+          ] },
+          { group: 'Account', items: [{ id: 'profile', label: 'Profile', icon: '👤' }] }
+        ];
+      }
+      var work = [
         { id: 'tasks', label: 'My tasks', icon: '🗂️' },
         { id: 'report', label: 'Daily report', icon: '📝' }
-      ] },
-      { group: 'Me', items: [
-        { id: 'attendance', label: 'Attendance', icon: '🕘' },
-        { id: 'earnings', label: 'Earnings', icon: '💰' },
-        { id: 'documents', label: 'Documents', icon: '📁' }
-      ] },
-      { group: 'Account', items: [
-        { id: 'reports', label: 'My reports', icon: '📊' },
-        { id: 'profile', label: 'Profile', icon: '👤' }
-      ] }
-    ],
+      ];
+      // Requirement 3 — Software Developers get a dedicated, badged home for
+      // tasks escalated to them, so an escalation can never be missed.
+      if ((App.state.profile || {}).isDeveloper) {
+        work.splice(1, 0, { id: 'escalated', label: 'Escalated to me', icon: '🚀' });
+      }
+      return [
+        { group: 'Overview', items: [{ id: 'dashboard', label: 'Dashboard', icon: '🏠' }] },
+        { group: 'My work', items: work },
+        { group: 'Me', items: [
+          { id: 'attendance', label: 'Attendance', icon: '🕘' },
+          { id: 'earnings', label: 'Earnings', icon: '💰' },
+          { id: 'documents', label: 'Documents', icon: '📁' }
+        ] },
+        { group: 'Account', items: [
+          { id: 'reports', label: 'My reports', icon: '📊' },
+          { id: 'profile', label: 'Profile', icon: '👤' }
+        ] }
+      ];
+    },
     views: views
   };
 })();

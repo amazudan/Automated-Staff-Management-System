@@ -72,11 +72,17 @@ var PayrollService = {
     var penalties = strikeStats.penaltyTotal;
     var adjustments = 0;
 
+    // Lateness deduction — a flat amount per late sign-in this period
+    // (Config.LateDeductionPerDay, default ₦500). Counted from attendance.
+    var attStats = AttendanceService.statsFor(staffId, period);
+    var lateDays = Util.num(attStats.late, 0);
+    var lateDeduction = Util.money(lateDays * CFG.num('LateDeductionPerDay', 500));
+
     // Carry forward any manual adjustment already recorded for this period.
     var existing = this.findRecord(staffId, period);
     if (existing) adjustments = Util.num(existing.Adjustments, 0);
 
-    var net = Util.money(earned - penalties + adjustments);
+    var net = Util.money(earned - penalties - lateDeduction + adjustments);
     // The guarantee this period represents, and how much of it the completion
     // percentages did not earn.
     var guaranteed = AllocationService.guaranteedForPeriod(staff, period);
@@ -99,6 +105,8 @@ var PayrollService = {
       progressEarned: Util.money(earned),
       forfeited: Util.money(Math.max(0, gross - earned)),
       penalties: penalties,
+      lateDays: lateDays,
+      lateDeduction: lateDeduction,
       adjustments: Util.money(adjustments),
       netPay: net < 0 ? 0 : net,
 
@@ -160,6 +168,7 @@ var PayrollService = {
         ProgressEarned: detail.progressEarned,
         Forfeited: detail.forfeited,
         Penalties: detail.penalties,
+        LateDeduction: detail.lateDeduction,
         Adjustments: detail.adjustments,
         NetPay: detail.netPay,
         Status: 'Draft',
@@ -194,7 +203,8 @@ var PayrollService = {
     if (!row) throw new Error('Payroll record not found.');
     if (String(row.Status) === 'Paid') throw new Error('A paid payroll record cannot be adjusted.');
     var adj = Util.money(amount);
-    var net = Util.money(Util.num(row.ProgressEarned, 0) - Util.num(row.Penalties, 0) + adj);
+    var net = Util.money(Util.num(row.ProgressEarned, 0) - Util.num(row.Penalties, 0) -
+                         Util.num(row.LateDeduction, 0) + adj);
     SheetDB.updateRowAt(SHEETS.PAYROLL, row.__row, {
       Adjustments: adj,
       NetPay: net < 0 ? 0 : net,
@@ -260,6 +270,7 @@ var PayrollService = {
         progressEarned: Util.money(p.ProgressEarned),
         forfeited: Util.money(p.Forfeited),
         penalties: Util.money(p.Penalties),
+        lateDeduction: Util.money(p.LateDeduction),
         adjustments: Util.money(p.Adjustments),
         netPay: Util.money(p.NetPay),
         status: String(p.Status),
@@ -284,6 +295,7 @@ var PayrollService = {
         progressEarned: Util.money(p.ProgressEarned),
         forfeited: Util.money(p.Forfeited),
         penalties: Util.money(p.Penalties),
+        lateDeduction: Util.money(p.LateDeduction),
         netPay: Util.money(p.NetPay),
         status: String(p.Status),
         paidAt: Util.dateKey(p.PaidAt)
@@ -298,7 +310,7 @@ var PayrollService = {
     var period = Util.resolvePeriod(periodType || 'Monthly', refDate);
     var totals = {
       periodLabel: period.label, guaranteed: 0, gross: 0, earned: 0, penalties: 0,
-      net: 0, pendingValidationValue: 0, forfeited: 0, staffCount: 0
+      lateDeductions: 0, net: 0, pendingValidationValue: 0, forfeited: 0, staffCount: 0
     };
 
     StaffService.active().forEach(function (staff) {
@@ -307,13 +319,14 @@ var PayrollService = {
       totals.gross += d.grossAllocated;
       totals.earned += d.progressEarned;
       totals.penalties += d.penalties;
+      totals.lateDeductions += d.lateDeduction;
       totals.net += d.netPay;
       totals.pendingValidationValue += d.unpaidBecauseUnvalidated;
       totals.forfeited += d.forfeited;
       totals.staffCount++;
     });
 
-    ['guaranteed', 'gross', 'earned', 'penalties', 'net', 'pendingValidationValue', 'forfeited']
+    ['guaranteed', 'gross', 'earned', 'penalties', 'lateDeductions', 'net', 'pendingValidationValue', 'forfeited']
       .forEach(function (k) { totals[k] = Util.money(totals[k]); });
     totals.payoutRate = Util.rate(totals.earned, totals.gross);
     // How much of the promised salary bill the completion percentages released.

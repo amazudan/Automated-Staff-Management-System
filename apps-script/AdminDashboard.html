@@ -314,12 +314,24 @@
       }).join('') : '<div class="muted small">No documents attached.</div>';
 
       var actions = [{ label: 'Close' }];
+      var mgmt = App.state.profile && App.state.profile.isManagement;
       if (t.status === 'PendingValidation') {
+        actions.unshift({ label: 'Re-assign (follow-up)', close: false, onClick: function () { openFollowUp(t); } });
         actions.unshift({ label: 'Reject', tone: 'danger', close: false, onClick: function () { openReject(t); } });
         actions.unshift({ label: 'Validate', tone: 'brand', close: false, onClick: function () { openValidate(t); } });
       } else if (t.status !== 'Completed' && t.status !== 'Failed' && t.status !== 'Cancelled') {
         actions.unshift({ label: 'Upload file', close: false, onClick: function () { App.openUpload({ taskId: t.taskId, taskTitle: t.title }); } });
         actions.unshift({ label: 'Edit', tone: 'brand', close: false, onClick: function () { openTaskEdit(t); } });
+      }
+      // Requirement 4 — an approved (Completed) task can be reversed back to
+      // "yet to validate" so it can be validated again.
+      if (t.status === 'Completed') {
+        actions.unshift({ label: 'Reverse approval', tone: 'danger', close: false, onClick: function () { openReverse(t); } });
+      }
+      // Requirement 3 — management can validate any task at any time (the server
+      // allows validating anything that is not cancelled).
+      if (mgmt && t.status !== 'PendingValidation' && t.status !== 'Completed' && t.status !== 'Cancelled') {
+        actions.unshift({ label: 'Validate', tone: 'brand', close: false, onClick: function () { openValidate(t); } });
       }
       // A failed task can be reassigned (and reactivated) to another staff
       // member; any open task can simply change hands.
@@ -357,6 +369,7 @@
       actions: [
         { label: 'Cancel' },
         { label: 'Reject instead', tone: 'danger', close: false, onClick: function () { openReject(task); } },
+        { label: 'Re-assign (follow-up)', close: false, onClick: function () { openFollowUp(task); } },
         submit('Save validation', function (c) {
           var v = c.values();
           return App.api('api_taskValidate', {
@@ -434,6 +447,88 @@
     }).catch(function (e) { App.busy(false); App.toast(e && e.message ? e.message : String(e), 'bad'); });
   }
 
+  /* Requirement 1 — re-assign a task as a no-penalty "Follow-up:". The same
+     person is allowed (the work simply re-appears on their board); a different
+     staff member can also be chosen. Reached from the Validate dropdown. */
+  function openFollowUp(task) {
+    if (!task) return;
+    App.busy(true);
+    loadAssignable().then(function (list) {
+      App.busy(false);
+      var options = (list || []).map(function (s) {
+        return { value: s.staffId,
+          label: s.name + (String(s.staffId) === String(task.assignedTo) ? ' (same person)' : '') +
+                 (s.department ? ' · ' + s.department : '') };
+      });
+      if (!options.length) { App.toast('No active staff to assign to.', 'warn'); return; }
+      var today = App.state.config.today;
+      App.modal({
+        title: 'Re-assign as follow-up — ' + task.title,
+        body:
+          '<p class="muted small">This re-opens the work under a “Follow-up:” heading with <b>no penalty</b>. ' +
+            'Leave the same person selected to hand it straight back to them.</p>' +
+          '<div class="li-sub" style="margin-bottom:8px">Currently with <b>' + esc(task.assignedToName) +
+            '</b> · ' + UI.taskPill(task.status) + '</div>' +
+          field('Follow-up owner', '<select data-field="staffId">' + opt(options, task.assignedTo) + '</select>') +
+          field('New due date', '<input type="date" data-field="dueDate" value="' + esc(today) + '">'),
+        actions: [
+          { label: 'Cancel' },
+          submit('Create follow-up', function (c) {
+            var v = c.values();
+            if (!v.staffId) { App.toast('Choose who takes the follow-up.', 'warn'); return; }
+            return App.api('api_taskReassign', {
+              taskId: task.taskId, staffId: v.staffId, dueDate: v.dueDate, followUp: true
+            }).then(function (r) {
+              App.closeModal();
+              App.toast('Follow-up created for ' + (r.assignedToName || 'staff') + ' — no penalty applied.', 'good');
+              App.refresh();
+            });
+          })
+        ]
+      });
+    }).catch(function (e) { App.busy(false); App.toast(e && e.message ? e.message : String(e), 'bad'); });
+  }
+
+  /* Requirement 4 — reverse an approved task back to "yet to validate". */
+  function openReverse(task) {
+    if (!task) return;
+    App.confirm({
+      title: 'Reverse approval — ' + task.title,
+      message: 'This sends the approved task back to “Yet to validate”. Its validated progress and pay ' +
+               'are reset to zero until it is validated again.',
+      note: true, noteLabel: 'Note (optional)', confirmLabel: 'Reverse', tone: 'danger'
+    }).then(function (note) {
+      if (note === null) return;
+      App.api('api_taskReverse', { taskId: task.taskId, comment: note })
+        .then(function () { App.toast('Approval reversed — back to yet-to-validate.', 'good'); App.refresh(); })
+        .catch(function (e) { App.toast(e && e.message ? e.message : String(e), 'bad'); });
+    });
+  }
+
+  /* A tiny inline dropdown (requirement 1). items: [{label, act, id, cls}]. */
+  var _menuCss = false;
+  function ensureMenuCss() {
+    if (_menuCss || typeof document === 'undefined') return;
+    _menuCss = true;
+    var s = document.createElement('style');
+    s.textContent = '.act-menu>summary{list-style:none;cursor:pointer}' +
+      '.act-menu>summary::-webkit-details-marker{display:none}';
+    document.head.appendChild(s);
+  }
+  function actMenu(label, items, cls) {
+    ensureMenuCss();
+    return '<details class="act-menu" style="position:relative;display:inline-block">' +
+      '<summary class="btn xs ' + (cls || 'btn-brand') + '">' + esc(label) + ' ▾</summary>' +
+      '<div style="position:absolute;right:0;top:calc(100% + 4px);z-index:60;background:var(--card,#fff);' +
+        'border:1px solid var(--line,#e5e7eb);border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.16);' +
+        'padding:6px;min-width:180px;display:grid;gap:4px">' +
+      (items || []).map(function (it) {
+        return '<button class="btn xs ' + (it.cls || '') + '" data-act="' + it.act +
+          '" data-id="' + esc(it.id || '') + '" style="width:100%;text-align:left">' + esc(it.label) + '</button>';
+      }).join('') +
+      '</div></details>';
+  }
+
   function reviewReport(reportId, decision) {
     if (decision === 'Approved') {
       return App.api('api_dailyReportReview', { reportId: reportId, decision: 'Approved', comment: '' })
@@ -455,8 +550,16 @@
      STAFF MODALS
      ====================================================================== */
   function staffFormBody(s) {
-    var roles = ['Staff', 'Manager', 'Admin']; s = s || {};
+    s = s || {};
     var cfg = App.state.config || {};
+    var me = App.state.profile || {};
+    // Requirement 3 — assignable roles come from the server (Management,
+    // Operations, Software Developer, Staff). Only management may grant the
+    // Management role, so operations sees the rest.
+    var roles = (cfg.roles || ['Management', 'Operations', 'Software Developer', 'Staff'])
+      .filter(function (r) { return me.isManagement || r !== 'Management'; });
+    // Never drop a role someone already holds (e.g. a legacy Admin/Manager row).
+    if (s.role && roles.indexOf(s.role) === -1) roles = [s.role].concat(roles);
     var salary = s.monthlySalary != null && s.monthlySalary !== ''
       ? s.monthlySalary
       : (cfg.defaultMonthlySalary || '');
@@ -479,7 +582,19 @@
         cfg.autoAllocateFromSalary === false
           ? 'Recorded for reference. Automatic allocation is switched off, so task amounts are typed in per task.'
           : 'This figure is shared across the tasks due in each month — one task carries all of it, four tasks carry a quarter each — and every task then pays out on its completion percentage.') +
-      field('Photo URL', '<input type="text" data-field="photoUrl" value="' + esc(s.photoUrl || '') + '" placeholder="Optional link to a photo">') +
+                       field('Photo URL', '<input type="text" data-field="photoUrl" value="' + esc(s.photoUrl || '') + '" placeholder="Optional link to a photo">') +
+      field('Access level',
+        '<select data-field="accessLevel">' +
+          '<option value="Full"' + ((s.accessLevel || 'Full') === 'Full' ? ' selected' : '') + '>Full — sees earnings, daily reports, full history</option>' +
+          '<option value="Restricted"' + (s.accessLevel === 'Restricted' ? ' selected' : '') + '>Restricted — sign in, own tasks, uploads only (no salary/earnings visible)</option>' +
+        '</select>',
+        'Use Position above to name the role however you like (e.g. "Front Desk", "Receptionist"). Access level controls what they can actually see and do.') +
+      field('Can assign tasks',
+        '<select data-field="canAssignTasks">' +
+          '<option value="false"' + (!s.canAssignTasks ? ' selected' : '') + '>No</option>' +
+          '<option value="true"' + (s.canAssignTasks ? ' selected' : '') + '>Yes — can create and assign tasks to others</option>' +
+        '</select>',
+        'Lets them assign tasks like an admin, without giving access to salaries, payroll or settings.') +
       (s.staffId ? '' : field('PIN (optional)',
         '<input type="text" data-field="pin" inputmode="numeric" placeholder="Leave blank to auto-generate">',
         'A 4–8 digit PIN for email + PIN sign-in. If blank, one is generated and shown to you.')) +
@@ -678,31 +793,36 @@
   }
 
   function openAttendanceLog(staffId, name) {
-    App.busy(true);
-    App.api('api_attendanceList', { staffId: staffId, periodType: App.period() }).then(function (rows) {
-      App.busy(false);
-      var body = (rows && rows.length) ? UI.table({
-        cols: [
-          { label: 'Date', render: function (a) { return esc(a.date); } },
-          { label: 'Status', render: function (a) { return UI.attPill(a.status); } },
-          { label: 'In', render: function (a) { return esc(a.loginTime || '—'); } },
-          { label: 'Out', render: function (a) { return esc(a.logoutTime || '—'); } },
-          { label: 'Late', align: 'right', render: function (a) { return a.minutesLate ? a.minutesLate + 'm' : '—'; } },
-          { label: 'Notes', render: function (a) { return esc(a.notes || ''); } }
-        ],
-        rows: rows,
-        searchFields: ['date', 'status', 'notes'],
-        empty: 'No sign-ins'
-      }) : UI.empty('🗓️', 'No sign-ins', 'Nothing recorded for ' + App.periodLabel(App.period()));
-      App.modal({
-        title: (name || 'Staff') + ' — attendance',
-        sub: App.periodLabel(App.period()),
-        wide: true,
-        body: body,
-        actions: [{ label: 'Close' }]
-      });
-    }).catch(function (e) { App.busy(false); App.toast(e && e.message ? e.message : String(e), 'bad'); });
-  }
+  App.busy(true);
+  App.api('api_attendanceList', { staffId: staffId, periodType: App.period() }).then(function (rows) {
+    App.busy(false);
+    var body = (rows && rows.length) ? UI.table({
+      cols: [
+        { label: 'Date', render: function (a) { return esc(a.date); } },
+        { label: 'Status', render: function (a) { return UI.attPill(a.status); } },
+        { label: 'In', render: function (a) { return esc(a.loginTime || '—'); } },
+        { label: 'Out', render: function (a) { return esc(a.logoutTime || '—'); } },
+        { label: 'Late', align: 'right', render: function (a) { return a.minutesLate ? a.minutesLate + 'm' : '—'; } },
+        { label: 'Device', render: function (a) { return esc(a.deviceType || '—'); } },
+        { label: 'Location', render: function (a) {
+          if (a.distanceMeters == null) return a.locationFlagged ? '<span class="li-sub">🚩 no location</span>' : '—';
+          return (a.locationFlagged ? '🚩 ' : '') + a.distanceMeters + 'm';
+        } },
+        { label: 'Notes', render: function (a) { return esc(a.notes || ''); } }
+      ],
+      rows: rows,
+      searchFields: ['date', 'status', 'notes', 'deviceType'],
+      empty: 'No sign-ins'
+    }) : UI.empty('🗓️', 'No sign-ins', 'Nothing recorded for ' + App.periodLabel(App.period()));
+    App.modal({
+      title: (name || 'Staff') + ' — attendance',
+      sub: App.periodLabel(App.period()),
+      wide: true,
+      body: body,
+      actions: [{ label: 'Close' }]
+    });
+  }).catch(function (e) { App.busy(false); App.toast(e && e.message ? e.message : String(e), 'bad'); });
+}
 
   function runPayroll() {
     var period = App.period();
@@ -818,6 +938,86 @@
   var views = {};
 
   /* ---------- Dashboard ---------- */
+  /* ======================================================================
+     PERSONAL ATTENDANCE (operations & any non-management admin)
+     Requirement — every role except management signs in each working day.
+     Operations run this admin dashboard, so they clock in from here, reusing
+     the same api_signAttendance / api_signOutAttendance as the staff portal.
+     ====================================================================== */
+  function getDeviceType() {
+    try {
+      var ua = navigator.userAgent || '';
+      var isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
+      var os = /Windows/i.test(ua) ? 'Windows'
+        : /Mac OS/i.test(ua) ? 'macOS'
+        : /Android/i.test(ua) ? 'Android'
+        : /iPhone|iPad|iPod/i.test(ua) ? 'iOS'
+        : /Linux/i.test(ua) ? 'Linux'
+        : 'Unknown';
+      return (isMobile ? 'Mobile' : 'Desktop') + ' · ' + os;
+    } catch (e) { return 'Unknown'; }
+  }
+
+  function getLocation() {
+    return new Promise(function (resolve) {
+      if (!navigator.geolocation) return resolve({ latitude: null, longitude: null });
+      navigator.geolocation.getCurrentPosition(
+        function (pos) { resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }); },
+        function () { resolve({ latitude: null, longitude: null }); },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+      );
+    });
+  }
+
+  function signIn() {
+    App.busy(true);
+    getLocation().then(function (loc) {
+      return App.api('api_signAttendance', {
+        meta: { deviceType: getDeviceType(), latitude: loc.latitude, longitude: loc.longitude }
+      });
+    }).then(function (r) {
+      App.busy(false);
+      r = r || {};
+      var late = r.minutesLate ? ' — ' + r.minutesLate + ' min late' : '';
+      var flag = r.locationFlagged ? ' ⚠ location flagged for review' : '';
+      App.toast('Signed in' + late + flag + '.', (r.minutesLate || r.locationFlagged) ? 'warn' : 'good');
+      App.refresh();
+    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  function signOut() {
+    App.busy(true);
+    App.api('api_signOutAttendance').then(function () {
+      App.busy(false); App.toast('Signed out. See you tomorrow.', 'good'); App.refresh();
+    }).catch(function (e) { App.busy(false); App.toast(e.message, 'bad'); });
+  }
+
+  /** The caller's own attendance clock-in — always about the signed-in admin. */
+  function attendanceCard(att) {
+    var t = att.today;
+    var me = App.state.profile || {};
+    var body;
+    if (!att.signedIn) {
+      body = '<p class="muted small">You have not signed in today.</p>' +
+        '<button class="btn btn-brand block mt" data-act="signin">Sign in now</button>';
+    } else {
+      var out = t && t.logoutTime;
+      body = '<div class="wrap" style="margin-bottom:10px">' + UI.attPill(t ? t.status : 'OnTime') +
+        (t && t.loginTime ? ' ' + UI.pill('In ' + t.loginTime, 'grey') : '') +
+        (out ? ' ' + UI.pill('Out ' + t.logoutTime, 'grey') : '') +
+        (t && t.minutesLate ? ' ' + UI.pill(t.minutesLate + ' min late', 'amber') : '') + '</div>' +
+        (out ? '<p class="muted small">You are signed out for today.</p>'
+             : '<button class="btn btn-ghost block" data-act="signout">Sign out</button>');
+    }
+    return UI.card({
+      title: 'My attendance today',
+      sub: [me.name || '', me.staffId || '',
+            att.stats ? UI.pct(att.stats.attendanceRate) + ' this period' : '']
+             .filter(function (x) { return x; }).join(' · '),
+      body: body
+    });
+  }
+
   views.dashboard = {
     title: 'Dashboard',
     sub: function () { return 'Overview · ' + App.periodLabel(App.period()); },
@@ -829,17 +1029,23 @@
         remember(d.buckets.completed); remember(d.buckets.pending); remember(d.buckets.inProgress);
 
         var b = d.board;
+        // Operations users get no payroll figures from the server (payroll is
+        // null), so fall back to an Overdue KPI instead of crashing.
+        var payKpi = d.payroll
+          ? '<div data-act="go" data-id="payroll" style="cursor:pointer">' +
+              UI.kpi({ label: 'Net payable', value: money(d.payroll.net), icon: '💰', dark: true,
+                       foot: d.payroll.guaranteed
+                         ? UI.pct(d.payroll.guaranteeRate) + ' of a ' + money(d.payroll.guaranteed) +
+                           ' guaranteed bill · ' + d.payroll.periodLabel
+                         : d.payroll.periodLabel }) + '</div>'
+          : UI.kpi({ label: 'Overdue', value: b.overdue, icon: '⏰', dark: true,
+                     foot: b.priority + ' priority · ' + b.total + ' active tasks' });
         var kpis = UI.grid('g-4', [
           UI.kpi({ label: 'Completed', value: b.completed, icon: '✅', foot: 'of ' + b.total + ' active tasks' }),
           '<div data-act="go" data-id="validation" style="cursor:pointer">' +
             UI.kpi({ label: 'Yet to validate', value: b.pending, icon: '🕵️', foot: 'Awaiting your sign-off' }) + '</div>',
           UI.kpi({ label: 'In progress', value: b.inProgress, icon: '🔧', foot: b.overdue + ' overdue · ' + b.priority + ' priority' }),
-          '<div data-act="go" data-id="payroll" style="cursor:pointer">' +
-            UI.kpi({ label: 'Net payable', value: money(d.payroll.net), icon: '💰', dark: true,
-                     foot: d.payroll.guaranteed
-                       ? UI.pct(d.payroll.guaranteeRate) + ' of a ' + money(d.payroll.guaranteed) +
-                         ' guaranteed bill · ' + d.payroll.periodLabel
-                       : d.payroll.periodLabel }) + '</div>'
+          payKpi
         ].join(''));
 
         var charts = UI.grid('g-2-1',
@@ -905,11 +1111,23 @@
           UI.card({ title: 'Top performers', sub: d.period.label, body: perfTable }) +
           UI.card({ title: 'Daily reports today', sub: reps.length + ' filed', actions: actBtn('Review all', 'go', 'validation'), body: repsBody }));
 
-        mount.innerHTML = kpis + spacer() + charts + spacer() + buckets + spacer() + people + spacer() + bottom;
+        // Operations (and any non-management admin) must sign attendance too,
+        // so give them their own clock-in card at the top of the dashboard.
+        var myAtt = (d.myAttendance && !d.myAttendance.exempt)
+          ? UI.grid('g-1-2', attendanceCard(d.myAttendance) +
+              UI.card({ title: 'Attendance is required',
+                        body: '<p class="muted small">Every role except management signs in each ' +
+                          'working day. Your sign-in is recorded with your device and location, the ' +
+                          'same as the rest of the team.</p>' })) + spacer()
+          : '';
+
+        mount.innerHTML = kpis + spacer() + myAtt + charts + spacer() + buckets + spacer() + people + spacer() + bottom;
 
         bind(mount, {
           go: function (id) { App.setView(id); },
           task: function (id) { openTaskDetail(id); },
+          signin: function () { signIn(); },
+          signout: function () { signOut(); },
           clear: function (id) { var s = d.flagged.find(function (x) { return x.staffId === id; }); clearRecord(id, s ? s.name : 'this staff member'); },
           'rep-ok': function (id) { reviewReport(id, 'Approved'); },
           'rep-no': function (id) { reviewReport(id, 'Rejected'); }
@@ -965,11 +1183,17 @@
               } },
               { label: '', align: 'right', render: function (t) {
                 var a = actBtn('View', 'task', t.taskId);
-                if (t.status === 'PendingValidation') a += ' ' + actBtn('Validate', 'validate', t.taskId, 'btn-brand');
+                // Requirement 1 — Validate is a dropdown of Validate / Re-assign (follow-up).
+                if (t.status === 'PendingValidation') a += ' ' + actMenu('Validate', [
+                  { label: 'Validate', act: 'validate', id: t.taskId, cls: 'btn-brand' },
+                  { label: 'Re-assign (follow-up)', act: 'followup', id: t.taskId }
+                ]);
                 else if (t.status !== 'Completed' && t.status !== 'Failed' && t.status !== 'Cancelled') a += ' ' + actBtn('Edit', 'edit', t.taskId);
                 // A failed task can be reactivated onto someone new; open tasks can change hands.
                 if (t.status === 'Failed') a += ' ' + actBtn('Reassign', 'reassign', t.taskId, 'btn-brand');
                 else if (t.status !== 'Completed' && t.status !== 'Cancelled') a += ' ' + actBtn('Reassign', 'reassign', t.taskId);
+                // Requirement 4 — reverse an approved task back to yet-to-validate.
+                if (t.status === 'Completed') a += ' ' + actBtn('Reverse', 'reverse', t.taskId, 'btn-ghost');
                 a += ' ' + actBtn('File', 'file', t.taskId);
                 return a;
               } }
@@ -996,6 +1220,8 @@
           new: function () { openTaskCreate(); },
           task: function (id) { openTaskDetail(id); },
           validate: function (id) { withTask(id).then(openValidate); },
+          followup: function (id) { withTask(id).then(openFollowUp); },
+          reverse: function (id) { withTask(id).then(openReverse); },
           edit: function (id) { withTask(id).then(openTaskEdit); },
           reassign: function (id) { withTask(id).then(openReassign); },
           // Requirement 6 — attach a document straight onto one task, and it
@@ -1036,7 +1262,11 @@
             { label: 'Submitted', render: function (t) { return esc(t.submittedAt || '—'); } },
             { label: 'Worth', align: 'right', render: function (t) { return money(t.amountAllocated); } },
             { label: '', align: 'right', render: function (t) {
-              return actBtn('View', 'task', t.taskId) + ' ' + actBtn('Validate', 'validate', t.taskId, 'btn-brand') +
+              return actBtn('View', 'task', t.taskId) + ' ' +
+                actMenu('Validate', [
+                  { label: 'Validate', act: 'validate', id: t.taskId, cls: 'btn-brand' },
+                  { label: 'Re-assign (follow-up)', act: 'followup', id: t.taskId }
+                ]) +
                 ' ' + actBtn('Reject', 'reject', t.taskId, 'btn-ghost');
             } }
           ],
@@ -1065,6 +1295,7 @@
         bind(mount, {
           task: function (id) { openTaskDetail(id); },
           validate: function (id) { withTask(id).then(openValidate); },
+          followup: function (id) { withTask(id).then(openFollowUp); },
           reject: function (id) { withTask(id).then(openReject); },
           'rep-ok': function (id) { reviewReport(id, 'Approved'); },
           'rep-no': function (id) { reviewReport(id, 'Rejected'); },
@@ -1202,8 +1433,11 @@
         var rows = summary.rows || [];
         var boardRows = board.rows.length ? board.rows.map(function (r) {
           return '<div class="list-item flat">' + UI.avatar({ name: r.name, photoUrl: r.photoUrl }, 'sm') +
-            '<div style="flex:1;min-width:0"><div class="li-title">' + esc(r.name) + '</div>' +
-            '<div class="li-sub">' + esc(r.department || '') + '</div></div>' +
+            '<div style="flex:1;min-width:0"><div class="li-title">' + esc(r.name) +
+              (r.locationFlagged ? ' 🚩' : '') + '</div>' +
+            '<div class="li-sub">' + esc(r.department || '') +
+              (r.deviceType ? ' · ' + esc(r.deviceType) : '') +
+              (r.distanceMeters != null ? ' · ' + r.distanceMeters + 'm from office' : '') + '</div></div>' +
             '<div class="right">' + UI.attPill(r.status) +
             (r.loginTime ? '<div class="li-sub">' + esc(r.loginTime) + (r.minutesLate ? ' · +' + r.minutesLate + 'm' : '') + '</div>' : '') + '</div>' +
             actBtn('Set', 'set', r.staffId) + '</div>';
@@ -1311,6 +1545,13 @@
     title: 'Payroll',
     sub: function () { return 'Progress-based pay · ' + App.periodLabel(App.period()); },
     render: function (mount) {
+      // Requirement 3 — payroll (payslips / net pay / approve / mark paid) is
+      // management-only. Operations can still see allocations under Allocation.
+      if (App.state.profile && !App.state.profile.canAccessPayroll) {
+        mount.innerHTML = UI.empty('🔒', 'Payroll is management-only',
+          'Ask a management user to run payroll. You can still review task allocations under Allocation.');
+        return Promise.resolve();
+      }
       return App.api('api_payrollPreview', { periodType: App.period() }).then(function (d) {
         var sum = d.summary, persisted = d.persisted || [];
         var usePersisted = persisted.length > 0;
@@ -1343,6 +1584,7 @@
               return r.forfeited ? '<span class="muted">' + money(r.forfeited) + '</span>' : '—';
             } },
             { label: 'Penalties', align: 'right', render: function (r) { return money(r.penalties); } },
+            { label: 'Lateness', align: 'right', render: function (r) { return money(r.lateDeduction || 0); } },
             { label: 'Adjust', align: 'right', render: function (r) { return money(r.adjustments); } },
             { label: 'Net', align: 'right', render: function (r) { return '<b>' + money(r.netPay) + '</b>'; } },
             { label: 'Status', render: function (r) { return UI.payPill(r.status); } },
@@ -1655,6 +1897,7 @@
       UI.kpi({ label: 'Progress earned', value: money(py.progressEarned) }),
       UI.kpi({ label: 'Forfeited', value: money(py.forfeited) }),
       UI.kpi({ label: 'Penalties', value: money(py.penalties) }),
+      UI.kpi({ label: 'Lateness', value: money(py.lateDeduction || 0) }),
       UI.kpi({ label: 'Adjustments', value: money(py.adjustments) }),
       UI.kpi({ label: 'Held (unvalidated)', value: money(py.heldPendingValidation) }),
       UI.kpi({ label: 'Net payable', value: money(py.netPayable), dark: true })
@@ -2056,28 +2299,34 @@
      ====================================================================== */
   window.AdminUI = {
     defaultView: 'dashboard',
-    nav: [
-      { group: 'Overview', items: [{ id: 'dashboard', label: 'Dashboard', icon: '🏠' }] },
-      { group: 'Work', items: [
-        { id: 'tasks', label: 'Tasks', icon: '🗂️' },
-        { id: 'validation', label: 'Validation', icon: '✅' }
-      ] },
-      { group: 'People', items: [
-        { id: 'staff', label: 'Staff', icon: '👥' },
-        { id: 'attendance', label: 'Attendance', icon: '🕘' },
-        { id: 'discipline', label: 'Discipline', icon: '⚠️' }
-      ] },
-      { group: 'Finance', items: [
-        { id: 'payroll', label: 'Payroll', icon: '💰' },
-        { id: 'allocation', label: 'Allocation', icon: '🧮' },
-        { id: 'reports', label: 'Reports', icon: '📊' }
-      ] },
-      { group: 'Workspace', items: [
-        { id: 'email', label: 'Email', icon: '✉️' },
-        { id: 'documents', label: 'Documents', icon: '📁' },
-        { id: 'settings', label: 'Settings', icon: '⚙️' }
-      ] }
-    ],
+    // Requirement 3 — operations users have no payroll access, so the Payroll
+    // item is hidden for them (Allocation + Reports stay). The client shell
+    // resolves nav as a function when it is one.
+    nav: function () {
+      var canPay = !App.state.profile || App.state.profile.canAccessPayroll;
+      var finance = [];
+      if (canPay) finance.push({ id: 'payroll', label: 'Payroll', icon: '💰' });
+      finance.push({ id: 'allocation', label: 'Allocation', icon: '🧮' });
+      finance.push({ id: 'reports', label: 'Reports', icon: '📊' });
+      return [
+        { group: 'Overview', items: [{ id: 'dashboard', label: 'Dashboard', icon: '🏠' }] },
+        { group: 'Work', items: [
+          { id: 'tasks', label: 'Tasks', icon: '🗂️' },
+          { id: 'validation', label: 'Validation', icon: '✅' }
+        ] },
+        { group: 'People', items: [
+          { id: 'staff', label: 'Staff', icon: '👥' },
+          { id: 'attendance', label: 'Attendance', icon: '🕘' },
+          { id: 'discipline', label: 'Discipline', icon: '⚠️' }
+        ] },
+        { group: 'Finance', items: finance },
+        { group: 'Workspace', items: [
+          { id: 'email', label: 'Email', icon: '✉️' },
+          { id: 'documents', label: 'Documents', icon: '📁' },
+          { id: 'settings', label: 'Settings', icon: '⚙️' }
+        ] }
+      ];
+    },
     views: views
   };
 })();
