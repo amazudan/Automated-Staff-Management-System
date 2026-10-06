@@ -156,6 +156,7 @@
       '<div class="login-legal">' + (admin
         ? 'Management console · management &amp; operations only.'
         : 'Private workspace · access is limited to registered staff.') + '</div>' +
+      amazuSignature() +
       '</div></div>';
 
     wire(root);
@@ -174,6 +175,27 @@
     if (!base) return '';
     return '<p class="small muted center mt"><a href="' + UI.esc(base) +
       '" target="_top">← Staff sign-in</a></p>';
+  }
+
+  /**
+   * Builder's signature — the AMAZU robot mark with a "powered by" credit.
+   * The mark is inline SVG so it needs no hosting and stays crisp at any size.
+   */
+  function amazuSignature() {
+    return '<div class="dev-signature" title="Built by AMAZU">' +
+      '<svg class="amazu-mark" viewBox="0 0 48 48" aria-hidden="true">' +
+      '<rect width="48" height="48" rx="12" fill="#0B2447"></rect>' +
+      '<rect x="22.4" y="5" width="3.2" height="6" rx="1.6" fill="#fff"></rect>' +
+      '<circle cx="24" cy="5.4" r="2.7" fill="#fff"></circle>' +
+      '<rect x="5" y="21" width="4" height="9" rx="2" fill="#fff"></rect>' +
+      '<rect x="39" y="21" width="4" height="9" rx="2" fill="#fff"></rect>' +
+      '<rect x="10.5" y="11" width="27" height="26" rx="8" fill="#fff"></rect>' +
+      '<rect x="17" y="18" width="5.5" height="10" rx="2.75" fill="#2FBF5B"></rect>' +
+      '<rect x="25.5" y="18" width="5.5" height="10" rx="2.75" fill="#2FBF5B"></rect>' +
+      '</svg>' +
+      '<span class="dev-by">powered by</span>' +
+      '<span class="dev-name">AMAZU</span>' +
+      '</div>';
   }
 
   window.LoginUI = {
